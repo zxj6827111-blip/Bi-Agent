@@ -1,0 +1,17 @@
+{
+  "name": "bi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地虚拟货币辅助交易信号系统，只提供行情扫描、AI 辅助分析和人工决策参考。",
+  "scripts": {
+    "start": "node src/server.js",
+    "replay": "node scripts/cryptoReplay.js",
+    "paper:live": "node scripts/livePaperTrade.js",
+    "monitor:formal": "node scripts/formalSignalPaperMonitor.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

@@ -1,0 +1,12 @@
+.git
+.codex
+.agents
+.playwright-mcp
+data
+node_modules
+npm-debug.log
+.env
+.env.*
+!.env.example
+*.bak
+test

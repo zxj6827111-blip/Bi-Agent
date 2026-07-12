@@ -1,0 +1,64 @@
+# ============================================================
+# Bi-Agent NAS 部署 — 飞牛 Docker Compose 配置
+# ============================================================
+# 用法：
+#   1. 将此文件重命名为 docker-compose.yml
+#   2. 复制 .env.nas 为 .env 并填写你的配置
+#   3. docker compose up -d --build
+# ============================================================
+
+services:
+  # ---- 纸面交易监控（主服务，24h 持续运行）----
+  bi-agent-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bi-agent-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      START_MODE: monitor
+      # 持续运行；脚本在 Asia/Shanghai 每日 00:00 自动归档 Session
+      FORMAL_MONITOR_DURATION_SECONDS: 0
+      FORMAL_MONITOR_TIMEZONE: Asia/Shanghai
+      FORMAL_MONITOR_OUTPUT_DIR: /app/data/formal-signal-monitor
+    volumes:
+      # 持久化数据目录 → NAS 共享文件夹
+      - ./data:/app/data
+    # 监控不需要暴露 Web 端口，如需 Web UI 可取消注释
+    # ports:
+    #   - "4173:4173"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # 健康检查：每 5 分钟检测进程是否存活
+    healthcheck:
+      test: ["CMD", "sh", "-c", "pgrep -f formalSignalPaperMonitor || exit 1"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+
+  # ---- Web UI（用于查看实时状态，含 Monitor 数据面板）----
+  bi-agent-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bi-agent-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      START_MODE: server
+    ports:
+      - "4173:4173"
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bi-Agent 本地交易辅助</title>
+    <link rel="stylesheet" href="/styles.css?v=20260705-market-watch" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="topbar">
+        <div>
+          <h1>Bi-Agent</h1>
+          <p>本地虚拟货币辅助分析，不自动下单</p>
+        </div>
+        <div class="status" id="runtimeStatus">未启动</div>
+      </section>
+
+      <section class="toolbar" aria-label="扫描控制">
+        <button class="primary" id="startBtn" type="button">开始扫描</button>
+        <button id="stopBtn" type="button">暂停扫描</button>
+        <button id="refreshBtn" type="button">刷新记录</button>
+        <button id="clearBtn" type="button">清空本轮结果</button>
+        <div class="hint">阶段性运行：需要时打开并扫描，关闭页面后不会继续扫。</div>
+      </section>
+
+      <section class="progress-panel" id="progressPanel" hidden>
+        <div class="progress-meta">
+          <strong id="progressPhase">准备扫描</strong>
+          <span id="progressPercent">0%</span>
+        </div>
+        <div class="progress-track" aria-label="扫描进度">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-detail" id="progressDetail">等待开始扫描。</div>
+      </section>
+
+      <section class="summary-grid" id="summaryGrid">
+        <article>
+          <span>信号数量</span>
+          <strong id="summarySignals">0</strong>
+        </article>
+        <article>
+          <span>现货扫描</span>
+          <strong id="summarySpot">0</strong>
+        </article>
+        <article>
+          <span>合约扫描</span>
+          <strong id="summaryFutures">0</strong>
+        </article>
+        <article>
+          <span>AI 配置</span>
+          <strong id="summaryAi">本地规则</strong>
+        </article>
+      </section>
+
+      <section class="market-errors" id="marketErrors" hidden></section>
+
+      <section class="panel watch-panel">
+        <div class="panel-head">
+          <h2>多币分时监控</h2>
+          <span id="watchStatus">未启动</span>
+        </div>
+        <div class="watch-controls">
+          <label class="sr-only" for="watchSymbol">输入币种，如 BTCUSDT ETHUSDT SOLUSDT</label>
+          <textarea id="watchSymbol" rows="2" placeholder="多个币种用空格、逗号或换行分隔，如 BTCUSDT ETHUSDT SOL">BTCUSDT ETHUSDT</textarea>
+          <label class="watch-scope-toggle">
+            <input id="watchAllMarket" type="checkbox" />
+            <span>全市场自动发现多/空</span>
+          </label>
+          <select id="watchMarket">
+            <option value="futures">合约监控</option>
+            <option value="auto">自动（合约优先）</option>
+            <option value="spot">现货监控</option>
+          </select>
+          <select id="watchRefresh">
+            <option value="20">20秒刷新</option>
+            <option value="30" selected>30秒刷新</option>
+            <option value="60">60秒刷新</option>
+          </select>
+          <button class="primary" id="watchStartBtn" type="button">开始监控</button>
+          <button id="watchStopBtn" type="button">停止监控</button>
+          <button id="watchRefreshBtn" type="button">立即刷新</button>
+        </div>
+        <div class="watch-grid" id="watchGrid">
+          <div class="detail-empty">输入币种后开始监控，AI 会结合分时状态给出提示。</div>
+        </div>
+      </section>
+
+      <section class="layout">
+        <section class="panel signal-panel">
+          <div class="panel-head">
+            <h2>候选机会</h2>
+            <div class="filters" id="filters">
+              <button class="active" data-filter="all" type="button">全部</button>
+              <button data-filter="spot" type="button">现货</button>
+              <button data-filter="futures" type="button">合约</button>
+              <button data-filter="long" type="button">做多</button>
+              <button data-filter="short" type="button">做空</button>
+            </div>
+          </div>
+          <div id="emptyState" class="empty">点击“开始扫描”后显示候选机会。</div>
+          <div id="signalsList" class="signals"></div>
+        </section>
+
+        <aside class="panel detail-panel">
+          <div class="panel-head">
+            <h2>信号详情</h2>
+            <span id="detailSource">未选择</span>
+          </div>
+          <div id="signalDetail" class="detail-empty">选择左侧一条信号查看点位、指标和风险。</div>
+        </aside>
+      </section>
+
+      <section class="panel history-panel">
+        <details class="collapsible-panel">
+          <summary class="panel-head collapsible-head">
+            <h2>复盘记录</h2>
+            <span class="collapsible-meta">最近 20 次扫描</span>
+          </summary>
+          <div id="historyList" class="history"></div>
+        </details>
+      </section>
+
+      <section class="panel evaluation-panel">
+        <div class="panel-head">
+          <h2>准确率复盘</h2>
+          <span id="evaluationStatus">读取中</span>
+        </div>
+        <div id="evaluationSummary" class="evaluation-summary"></div>
+      </section>
+
+      <!-- Monitor 纸面交易监控面板 -->
+      <section class="panel monitor-panel">
+        <div class="panel-head">
+          <h2>纸面交易监控 (Monitor)</h2>
+          <span id="monitorStatus">加载中</span>
+        </div>
+        <div id="monitorEmpty" class="empty">Monitor 数据加载中，或尚未生成数据。</div>
+
+        <!-- 概览统计 -->
+        <div id="monitorOverview" class="monitor-overview" hidden>
+          <div class="monitor-stat">
+            <span>Session 状态</span>
+            <strong id="monitorSessionStatus">-</strong>
+          </div>
+          <div class="monitor-stat">
+            <span>开始时间</span>
+            <strong id="monitorStartedAt">-</strong>
+          </div>
+          <div class="monitor-stat">
+            <span>扫描轮次</span>
+            <strong id="monitorScanCount">0</strong>
+          </div>
+          <div class="monitor-stat">
+            <span>总交易数</span>
+            <strong id="monitorTotalTrades">0</strong>
+          </div>
+          <div class="monitor-stat">
+            <span>胜率</span>
+            <strong id="monitorWinRate">-</strong>
+          </div>
+          <div class="monitor-stat">
+            <span>总收益</span>
+            <strong id="monitorTotalReturn">-</strong>
+          </div>
+        </div>
+
+        <!-- 当前持仓 -->
+        <div id="monitorPositions" class="monitor-section" hidden>
+          <h3>当前持仓</h3>
+          <div id="positionsList" class="monitor-table"></div>
+        </div>
+
+        <!-- 最近交易 -->
+        <div id="monitorTrades" class="monitor-section" hidden>
+          <h3>最近交易</h3>
+          <div id="tradesList" class="monitor-table"></div>
+        </div>
+
+        <!-- 历史 Session -->
+        <div id="monitorSessions" class="monitor-section" hidden>
+          <details class="collapsible-panel">
+            <summary class="monitor-section-head collapsible-head">
+              <h3>历史 Session</h3>
+              <span class="collapsible-meta">最近 10 条</span>
+            </summary>
+            <div id="sessionsList" class="monitor-table"></div>
+          </details>
+        </div>
+
+        <div id="monitorSessionDetail" class="monitor-section" hidden>
+          <h3 id="monitorSessionDetailTitle">Session 交易详情</h3>
+          <div id="monitorSessionDetailList" class="monitor-table"></div>
+        </div>
+
+        <!-- 错误日志 -->
+        <div id="monitorErrors" class="monitor-section" hidden>
+          <h3>最近错误</h3>
+          <div id="errorsList" class="monitor-errors"></div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js?v=20260712-persistent-monitor"></script>
+  </body>
+</html>
