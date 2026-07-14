@@ -1,5 +1,5 @@
 import { realizedAccountReturnPercent } from "./portfolioRisk.js";
-import { round } from "./utils.js";
+import { clamp, round } from "./utils.js";
 
 const BINANCE_DERIVATIVES_PERIODS = new Set(["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]);
 
@@ -94,8 +94,8 @@ export function hourBiasAt(nowMs = Date.now(), timeZone = "Asia/Shanghai") {
 export function hourAdjustedOptions(options, bias) {
   if (bias === "high_volatility") {
     return {
-      confirmationScans: Math.min(Number(options.confirmationScans) + 1, 4),
-      executionMaxSoftFailures: Math.max(0, Number(options.executionMaxSoftFailures) - 1)
+      // 时段只影响仓位；方向确认和候选质量由真实 ATR、价差及多周期数据决定。
+      maxPositionSizePercentOfEquity: Number(options.maxPositionSizePercentOfEquity) * 0.75
     };
   }
   if (bias === "low_liquidity") {
@@ -107,7 +107,72 @@ export function hourAdjustedOptions(options, bias) {
   return {};
 }
 
+export function classifyFilteredSourceQuality(candidate, formalEntryQuality) {
+  if (candidate?.sourceSignal?.qualityStatus !== "filtered") {
+    return { failure: false, warning: false };
+  }
+  return formalEntryQuality
+    ? { failure: false, warning: true }
+    : { failure: true, warning: false };
+}
+
+export function applyFormalTradeGeometry(candidate, options = {}) {
+  const entryPrice = Number(candidate?.entryPrice);
+  const atrPercent = Number(candidate?.atrPercent);
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(atrPercent) || atrPercent < 0) {
+    return { ...candidate };
+  }
+
+  const minTargetPercent = finiteOr(options.minTargetPercent, 0.35);
+  const maxTargetPercent = Math.max(minTargetPercent, finiteOr(options.maxTargetPercent, 1.2));
+  const minStopPercent = finiteOr(options.minStopPercent, 0.25);
+  const maxStopPercent = Math.max(minStopPercent, finiteOr(options.maxStopPercent, 0.85));
+  const targetAtrFraction = finiteOr(options.targetAtrFraction, 0.85);
+  const stopAtrFraction = finiteOr(options.stopAtrFraction, 0.62);
+  const roundTripCostPercent = Math.max(0, finiteOr(candidate.roundTripCostPercent, 0));
+
+  const targetPercent = clamp(
+    Math.max(minTargetPercent, atrPercent * targetAtrFraction),
+    minTargetPercent,
+    maxTargetPercent
+  );
+  const atrStop = atrPercent * stopAtrFraction;
+  const structuralStop = candidate.side === "long"
+    ? candidate.supportResistance?.support
+      ? ((entryPrice - Number(candidate.supportResistance.support)) / entryPrice) * 100
+      : atrStop
+    : candidate.supportResistance?.resistance
+      ? ((Number(candidate.supportResistance.resistance) - entryPrice) / entryPrice) * 100
+      : atrStop;
+  const stopPercent = clamp(
+    Math.min(atrStop * 1.2, Math.max(structuralStop * 0.8, atrStop)),
+    minStopPercent,
+    maxStopPercent
+  );
+  const rewardRisk = stopPercent > 0 ? targetPercent / stopPercent : null;
+
+  return {
+    ...candidate,
+    takeProfit: round(movePrice(entryPrice, candidate.side, targetPercent), 10),
+    stopLoss: round(movePrice(entryPrice, candidate.side, -stopPercent), 10),
+    targetPercent: round(targetPercent, 4),
+    stopPercent: round(stopPercent, 4),
+    netTargetPercent: round(targetPercent - roundTripCostPercent, 4),
+    rewardRisk: Number.isFinite(rewardRisk) ? round(rewardRisk, 4) : null
+  };
+}
+
 export function derivativesPeriodForInterval(interval) {
   if (["1m", "3m"].includes(interval)) return "5m";
   return BINANCE_DERIVATIVES_PERIODS.has(interval) ? interval : "15m";
+}
+
+function movePrice(price, side, movePercent) {
+  const direction = side === "long" ? 1 : -1;
+  return price * (1 + direction * (movePercent / 100));
+}
+
+function finiteOr(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }

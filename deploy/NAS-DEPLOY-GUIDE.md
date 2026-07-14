@@ -384,6 +384,43 @@ vi .env
 docker compose restart
 ```
 
+不要用仓库中的 `.env.nas` 覆盖已经运行的 `.env`。保留 NAS 上的密钥、通知配置和运行参数，只合并新增或明确调整的键。
+
+### 8.4 信号质量修复后的推荐配置
+
+以下配置保持硬风控，不再使用已经验证表现较差的宽松门槛：
+
+```dotenv
+FORMAL_MONITOR_MIN_SCORE=62
+FORMAL_MONITOR_MIN_EDGE=22
+FORMAL_MONITOR_EXECUTION_MIN_SCORE=60
+FORMAL_MONITOR_EXECUTION_MIN_EDGE=18
+FORMAL_MONITOR_EXECUTION_MAX_SOFT_FAILURES=1
+FORMAL_MONITOR_MAX_ATR_PERCENT=6
+FORMAL_MONITOR_OBSERVATION_LOG_LIMIT=3
+FORMAL_MONITOR_SHADOW_PROFILES=control:minEdge=22,minScore=62,targetAtrFraction=2.0,stopAtrFraction=1.2,minRewardRisk=1.5;frequency_probe:minEdge=20,minScore=60,targetAtrFraction=2.0,stopAtrFraction=1.2,minRewardRisk=1.35
+```
+
+若需要把高分观察候选发送到飞书，可在现有飞书配置中加入 `watch`：
+
+```dotenv
+FEISHU_MARKET_SIGNAL_LEVELS=formal,watch
+FEISHU_HIGH_PRECISION_ONLY=true
+```
+
+`watch` 只表示观察候选，不是开仓指令。通知仍受高精度阈值和冷却时间约束。
+
+更新后至少验证：
+
+```bash
+docker compose up -d --build
+docker compose logs --tail=200 bi-agent-monitor | grep -E 'hour-bias|observe|scan=|error|OPEN'
+cat data/formal-signal-monitor/latest.json | grep -A 20 'observationDigest'
+cat data/formal-signal-monitor/latest.json | grep -A 30 'shadowProfiles'
+```
+
+高波动时段的 `hour-bias` 应只显示仓位上限调整，不应再出现 `confirmationScans` 或 `executionMaxSoftFailures` 的动态收紧。
+
 ---
 
 ## 九、故障排查

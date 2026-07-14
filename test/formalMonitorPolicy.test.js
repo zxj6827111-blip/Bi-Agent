@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyFormalTradeGeometry,
   alignedOpenInterestChange,
   carryOpenTradeState,
   combineTradeRealizations,
+  classifyFilteredSourceQuality,
   derivativesPeriodForInterval,
   executablePrice,
   hardExitOutcome,
@@ -68,6 +70,52 @@ test("Shanghai session bias has explicit boundaries and halves low-liquidity exp
   }, "low_liquidity");
   assert.equal(adjusted.maxFormalSpreadPercent, 0.04);
   assert.equal(adjusted.maxPositionSizePercentOfEquity, 17.5);
+
+  const highVolatility = hourAdjustedOptions({
+    confirmationScans: 2,
+    executionMaxSoftFailures: 1,
+    maxPositionSizePercentOfEquity: 40
+  }, "high_volatility");
+  assert.deepEqual(highVolatility, { maxPositionSizePercentOfEquity: 30 });
+});
+
+test("filtered source becomes a warning after independent entry quality passes", () => {
+  const candidate = { sourceSignal: { qualityStatus: "filtered" } };
+  assert.deepEqual(classifyFilteredSourceQuality(candidate, true), { failure: false, warning: true });
+  assert.deepEqual(classifyFilteredSourceQuality(candidate, false), { failure: true, warning: false });
+});
+
+test("formal trade geometry is recalculated for each shadow profile", () => {
+  const candidate = {
+    symbol: "BTCUSDT",
+    side: "long",
+    entryPrice: 100,
+    atrPercent: 2,
+    roundTripCostPercent: 0.2,
+    supportResistance: { support: 95 }
+  };
+  const control = applyFormalTradeGeometry(candidate, {
+    minTargetPercent: 1,
+    maxTargetPercent: 12,
+    minStopPercent: 0.8,
+    maxStopPercent: 5,
+    targetAtrFraction: 2,
+    stopAtrFraction: 1.2
+  });
+  const shadow = applyFormalTradeGeometry(candidate, {
+    minTargetPercent: 1,
+    maxTargetPercent: 12,
+    minStopPercent: 0.8,
+    maxStopPercent: 5,
+    targetAtrFraction: 2.2,
+    stopAtrFraction: 1
+  });
+
+  assert.equal(control.targetPercent, 4);
+  assert.equal(control.stopPercent, 2.88);
+  assert.equal(shadow.targetPercent, 4.4);
+  assert.equal(shadow.stopPercent, 2.4);
+  assert.ok(shadow.rewardRisk > control.rewardRisk);
 });
 
 test("derivatives requests use the execution period when Binance supports it", () => {

@@ -8,8 +8,10 @@ import { buildMarketSnapshot, filterTradableSymbols, generateSignalsFromSnapshot
 import { enrichMarketWithFusion, fundingRateSignal, withMarketSource } from "../src/marketFusion.js";
 import { applyFeedbackRecommendationsOnce, buildFeedbackLoop } from "../src/formalMonitorFeedback.js";
 import {
+  applyFormalTradeGeometry,
   alignedOpenInterestChange,
   carryOpenTradeState,
+  classifyFilteredSourceQuality,
   combineTradeRealizations,
   derivativesPeriodForInterval,
   executablePrice,
@@ -24,7 +26,7 @@ import {
   portfolioEntryBlockers,
   realizedAccountReturnPercent
 } from "../src/portfolioRisk.js";
-import { isFeishuEnabled, sendFeishuText } from "../src/feishuNotifier.js";
+import { isFeishuEnabled, notifyFeishuMarketAlerts, sendFeishuText } from "../src/feishuNotifier.js";
 import { summarizePerformance } from "../src/tradeMetrics.js";
 import { clamp, mapWithConcurrency, round, safeJsonParse, sleep } from "../src/utils.js";
 import { atomicWriteJson, nextSessionDayIso, sessionDateKey, sessionFileName } from "../src/monitorPersistence.js";
@@ -133,6 +135,7 @@ const options = {
   watchMaxFailures: readInt("FORMAL_MONITOR_WATCH_MAX_FAILURES", 3),
   watchMinScore: readNumber("FORMAL_MONITOR_WATCH_MIN_SCORE", 68),
   watchMinEdge: readNumber("FORMAL_MONITOR_WATCH_MIN_EDGE", 18),
+  observationLogLimit: readInt("FORMAL_MONITOR_OBSERVATION_LOG_LIMIT", 3),
   shadowProfiles: parseShadowProfiles(process.env.FORMAL_MONITOR_SHADOW_PROFILES ?? defaultShadowProfiles),
   shadowAiEnabled: readBoolean("FORMAL_MONITOR_SHADOW_AI_ENABLED", false),
   shadowAiMaxCandidatesPerScan: readInt("FORMAL_MONITOR_SHADOW_AI_MAX_CANDIDATES", 2)
@@ -198,15 +201,18 @@ const state = {
       evaluated: 0,
       accepted: 0,
       rejected: 0,
-      failCounts: {}
+      failCounts: {},
+      warningCounts: {}
     },
     tierDiagnostics: {},
     watchDiagnostics: {
       evaluated: 0,
       accepted: 0,
       rejected: 0,
-      failCounts: {}
+      failCounts: {},
+      warningCounts: {}
     },
+    observationDigest: [],
     confirmationDiagnostics: {
       tracked: 0,
       evaluated: 0,
@@ -328,6 +334,9 @@ async function scanAndOpen() {
 
   try {
     const setup = await buildFormalCandidates();
+    const observationDigest = buildObservationDigest(setup);
+    logObservationDigest(observationDigest);
+    queueObservationFeishuNotifications(observationDigest, setup);
     updateAggregateDiagnostics(state.diagnostics.aggregate, setup.evaluatedCandidates);
     for (const [name, candidates] of Object.entries(setup.shadowProfiles)) {
       if (!state.diagnostics.shadowProfiles[name]) {
@@ -365,6 +374,7 @@ async function scanAndOpen() {
       tierDiagnostics: setup.tierDiagnostics,
       watchDiagnostics: setup.watchDiagnostics,
       confirmationDiagnostics: confirmation.diagnostics,
+      observationDigest,
       lastCandidates: reviewedCandidates.slice(0, 10).map(compactCandidate),
       lastPendingCandidates: confirmation.pendingCandidates.slice(0, 10).map(compactCandidate),
       lastFormalCandidates: setup.formalCandidates.slice(0, 10).map(compactCandidate),
@@ -531,6 +541,73 @@ function appendOpportunityHistory({ scan, seenAt, scalpAlerts = [], scalpCandida
   appendHistoryItems("scalpAlerts", scan, seenAt, scalpAlerts);
   appendHistoryItems("scalpCandidates", scan, seenAt, scalpCandidates);
   appendHistoryItems("watchlistCandidates", scan, seenAt, watchlistCandidates);
+}
+
+function buildObservationDigest(setup = {}) {
+  const sources = [
+    ["trade_candidate", setup.tradeCandidates],
+    ["scalp_decision", setup.scalpCandidates],
+    ["scalp_alert", setup.scalpAlerts],
+    ["watchlist", setup.watchlistCandidates],
+    ["near_pass", setup.nearPassCandidates]
+  ];
+  const seen = new Set();
+  const observations = [];
+  for (const [observationSource, candidates] of sources) {
+    for (const candidate of candidates || []) {
+      const key = `${candidate.symbol}:${candidate.side}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      observations.push({
+        observationSource,
+        ...compactCandidate(candidate)
+      });
+      if (observations.length >= Math.max(0, options.observationLogLimit)) return observations;
+    }
+  }
+  return observations;
+}
+
+function logObservationDigest(observations = []) {
+  const top = observations.map((candidate) => {
+    const blockers = candidate.tradeBlockers?.length
+      ? candidate.tradeBlockers
+      : candidate.filterFailures || [];
+    return `${candidate.symbol}:${candidate.side}:${candidate.observationSource}:score=${candidate.score}:edge=${candidate.edgeAligned}:blocked=${blockers.slice(0, 2).join("+") || "none"}`;
+  });
+  console.log(`[formal-monitor][observe] scan=${state.scanCount} top=${top.join(" | ") || "none"}`);
+}
+
+function queueObservationFeishuNotifications(observations = [], setup = {}) {
+  if (!isFeishuEnabled() || !observations.length) return;
+  const alerts = observations.map((candidate) => ({
+    symbol: candidate.symbol,
+    marketType: "spot",
+    actualMarketType: "spot",
+    direction: candidate.side,
+    signalLevel: "watch",
+    statusLabel: "观察信号（不可执行）",
+    timeframe: candidate.timeframePlan?.executionInterval || options.signalInterval,
+    price: candidate.entryPrice,
+    score: candidate.score,
+    riskReward: candidate.rewardRisk,
+    volumeRatio: candidate.volumeRatio,
+    entryRange: [candidate.entryPrice, candidate.entryPrice],
+    stopLoss: candidate.stopLoss,
+    takeProfit: { tp1: candidate.takeProfit },
+    reasons: [
+      candidate.watchReason,
+      ...(candidate.tradeBlockers || []),
+      ...(candidate.qualityWarnings || [])
+    ].filter(Boolean)
+  }));
+  const promise = notifyFeishuMarketAlerts(alerts, {
+    scope: "market",
+    scanTime: state.lastScanAt,
+    scannedMarkets: setup.analyzedMarkets,
+    eligibleMarkets: setup.eligibleSpotMarkets
+  }).finally(() => pendingFeishuNotifications.delete(promise));
+  pendingFeishuNotifications.add(promise);
 }
 
 function appendHistoryItems(key, scan, seenAt, candidates = []) {
@@ -725,7 +802,12 @@ async function buildFormalCandidates() {
       const resolved = resolveRiskProfile(profile);
       return [
         resolved.name,
-        baseCandidates.map((candidate) => evaluateCandidateWithProfile(candidate, resolved))
+        baseCandidates.map((candidate) => {
+          const replanned = candidate.tradeStyle === "scalp_momentum"
+            ? candidate
+            : applyFormalTradeGeometry(candidate, resolved);
+          return evaluateCandidateWithProfile(replanned, resolved);
+        })
       ];
     })
   );
@@ -1337,32 +1419,9 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
   const atrPercent = snapshot.indicators.atr && entryPrice
     ? (snapshot.indicators.atr / entryPrice) * 100
     : options.minStopPercent;
-  const targetPercent = clamp(
-    Math.max(options.minTargetPercent, atrPercent * options.targetAtrFraction),
-    options.minTargetPercent,
-    options.maxTargetPercent
-  );
-  // Phase 1.5G: 止损位与支撑阻力联动
-  // 做多时止损参考支撑位，做空时止损参考阻力位，避免被正常波动扫出
-  const srData = snapshot.supportResistance;
-  const atrStop = atrPercent * options.stopAtrFraction;
-  const structuralStop = side === "long"
-    ? (srData?.support
-        ? ((entryPrice - srData.support) / entryPrice) * 100
-        : atrStop)
-    : (srData?.resistance
-        ? ((srData.resistance - entryPrice) / entryPrice) * 100
-        : atrStop);
-  let stopPercent = clamp(
-    Math.min(atrStop * 1.2, Math.max(structuralStop * 0.8, atrStop)),
-    options.minStopPercent,
-    options.maxStopPercent
-  );
   const roundTripCostPercent = estimateFormalRoundTripCost().totalCostPercent;
-  const netTargetPercent = targetPercent - roundTripCostPercent;
-  const rewardRisk = stopPercent > 0 ? targetPercent / stopPercent : null;
 
-  const candidate = {
+  const candidate = applyFormalTradeGeometry({
     accepted: false,
     symbol: snapshot.symbol,
     side,
@@ -1373,13 +1432,7 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
     filterFailures: [],
     technicalAligned: selected.technicalAligned,
     entryPrice: round(entryPrice, 10),
-    takeProfit: round(applyMove(entryPrice, side, targetPercent), 10),
-    stopLoss: round(applyMove(entryPrice, side, -stopPercent), 10),
-    targetPercent: round(targetPercent, 4),
-    stopPercent: round(stopPercent, 4),
     roundTripCostPercent: round(roundTripCostPercent, 4),
-    netTargetPercent: round(netTargetPercent, 4),
-    rewardRisk: Number.isFinite(rewardRisk) ? round(rewardRisk, 4) : null,
     volumeRatio: round(volume, 4),
     atrPercent: round(atrPercent, 4),
     spreadPercent: round(snapshot.spreadPercent, 4),
@@ -1411,7 +1464,7 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
     marketRegime: snapshot.marketRegime || null,
     supportResistance: snapshot.supportResistance || null,
     vwapAnchorPrice: Number.isFinite(Number(vwapAnchorPrice)) ? round(Number(vwapAnchorPrice), 10) : null
-  };
+  }, options);
   const withScalpProfiles = {
     ...candidate,
     scalpAlertProfile: buildScalpAlertProfile(candidate)
@@ -1557,13 +1610,17 @@ function evaluateCandidateWithProfile(candidate, profile = resolveRiskProfile())
   // Phase 1.3F: 应用市场环境动态阈值
   const dynamicProfile = adjustThresholdsByRegime(safetyProfile, candidate);
   const filterFailures = [];
+  const qualityWarnings = [];
+  const formalEntryQuality = hasFormalEntryQuality(candidate);
+  const sourceQuality = classifyFilteredSourceQuality(candidate, formalEntryQuality);
   if (candidate.edgeAligned <= -options.edgeContradiction) filterFailures.push("edge_contradiction");
   else if (candidate.edgeAligned < dynamicProfile.minEdge) filterFailures.push("edge");
   if (candidate.score < dynamicProfile.minScore) filterFailures.push("score");
   if (!candidate.technicalAligned) filterFailures.push("technical");
   if (candidate.volumeRatio < dynamicProfile.minVolumeRatio) filterFailures.push("volume");
-  if (hasFilteredSourceSignal(candidate)) filterFailures.push("source_quality");
-  if (!hasFormalEntryQuality(candidate)) filterFailures.push("entry_quality");
+  if (sourceQuality.failure) filterFailures.push("source_quality");
+  if (sourceQuality.warning) qualityWarnings.push("source_quality");
+  if (!formalEntryQuality) filterFailures.push("entry_quality");
   if (candidate.timeframeAlignment?.hardOpposing?.length) filterFailures.push("timeframe_conflict");
   else if (candidate.timeframeAlignment && !candidate.timeframeAlignment.confirmed) {
     filterFailures.push("timeframe_confirmation");
@@ -1597,6 +1654,7 @@ function evaluateCandidateWithProfile(candidate, profile = resolveRiskProfile())
     signalTier,
     accepted,
     filterFailures,
+    qualityWarnings,
     hardFailures,
     softFailures,
     tradeBlockers,
@@ -1642,9 +1700,13 @@ function tradeCandidateBlockers(candidate) {
 
 function summarizeCandidateFilters(candidates) {
   const failCounts = {};
+  const warningCounts = {};
   for (const candidate of candidates) {
     for (const failure of candidate.filterFailures || []) {
       failCounts[failure] = (failCounts[failure] || 0) + 1;
+    }
+    for (const warning of candidate.qualityWarnings || []) {
+      warningCounts[warning] = (warningCounts[warning] || 0) + 1;
     }
   }
 
@@ -1652,7 +1714,8 @@ function summarizeCandidateFilters(candidates) {
     evaluated: candidates.length,
     accepted: candidates.filter((candidate) => candidate.accepted).length,
     rejected: candidates.filter((candidate) => !candidate.accepted).length,
-    failCounts
+    failCounts,
+    warningCounts
   };
 }
 
@@ -1664,6 +1727,7 @@ function summarizeCandidateTiers(candidates = []) {
       total: 0,
       bySide: {},
       failCounts: {},
+      warningCounts: {},
       tradeBlockerCounts: {},
       sourceSignalCount: 0,
       sourceQuality: {},
@@ -1680,6 +1744,9 @@ function summarizeCandidateTiers(candidates = []) {
     summary[tier].bySide[side] = (summary[tier].bySide[side] || 0) + 1;
     for (const failure of candidate.filterFailures || []) {
       summary[tier].failCounts[failure] = (summary[tier].failCounts[failure] || 0) + 1;
+    }
+    for (const warning of candidate.qualityWarnings || []) {
+      summary[tier].warningCounts[warning] = (summary[tier].warningCounts[warning] || 0) + 1;
     }
     for (const blocker of candidate.tradeBlockers || []) {
       summary[tier].tradeBlockerCounts[blocker] = (summary[tier].tradeBlockerCounts[blocker] || 0) + 1;
@@ -1700,7 +1767,13 @@ function resolveRiskProfile(profile = {}) {
     maxAtrPercent: numberWithFallback(profile.maxAtrPercent, options.maxAtrPercent),
     maxFormalSpreadPercent: numberWithFallback(profile.maxFormalSpreadPercent, options.maxFormalSpreadPercent),
     minNetTargetPercent: numberWithFallback(profile.minNetTargetPercent, options.minNetTargetPercent),
-    minRewardRisk: numberWithFallback(profile.minRewardRisk, options.minRewardRisk)
+    minRewardRisk: numberWithFallback(profile.minRewardRisk, options.minRewardRisk),
+    minTargetPercent: numberWithFallback(profile.minTargetPercent, options.minTargetPercent),
+    maxTargetPercent: numberWithFallback(profile.maxTargetPercent, options.maxTargetPercent),
+    minStopPercent: numberWithFallback(profile.minStopPercent, options.minStopPercent),
+    maxStopPercent: numberWithFallback(profile.maxStopPercent, options.maxStopPercent),
+    targetAtrFraction: numberWithFallback(profile.targetAtrFraction, options.targetAtrFraction),
+    stopAtrFraction: numberWithFallback(profile.stopAtrFraction, options.stopAtrFraction)
   };
 }
 
@@ -1745,12 +1818,17 @@ function createAggregateDiagnostics(profileName) {
     accepted: 0,
     rejected: 0,
     failCounts: {},
+    warningCounts: {},
     bySide: {},
     nearPassCandidates: []
   };
 }
 
 function updateAggregateDiagnostics(target, candidates = []) {
+  target.failCounts ||= {};
+  target.warningCounts ||= {};
+  target.bySide ||= {};
+  target.nearPassCandidates ||= [];
   target.scans += 1;
   target.evaluated += candidates.length;
   target.accepted += candidates.filter((candidate) => candidate.accepted).length;
@@ -1760,13 +1838,21 @@ function updateAggregateDiagnostics(target, candidates = []) {
     for (const failure of candidate.filterFailures || []) {
       target.failCounts[failure] = (target.failCounts[failure] || 0) + 1;
     }
+    for (const warning of candidate.qualityWarnings || []) {
+      target.warningCounts[warning] = (target.warningCounts[warning] || 0) + 1;
+    }
     const side = candidate.side || "unknown";
-    target.bySide[side] ||= { evaluated: 0, accepted: 0, rejected: 0, failCounts: {} };
+    target.bySide[side] ||= { evaluated: 0, accepted: 0, rejected: 0, failCounts: {}, warningCounts: {} };
+    target.bySide[side].failCounts ||= {};
+    target.bySide[side].warningCounts ||= {};
     target.bySide[side].evaluated += 1;
     if (candidate.accepted) target.bySide[side].accepted += 1;
     else target.bySide[side].rejected += 1;
     for (const failure of candidate.filterFailures || []) {
       target.bySide[side].failCounts[failure] = (target.bySide[side].failCounts[failure] || 0) + 1;
+    }
+    for (const warning of candidate.qualityWarnings || []) {
+      target.bySide[side].warningCounts[warning] = (target.bySide[side].warningCounts[warning] || 0) + 1;
     }
   }
 
@@ -2335,6 +2421,7 @@ function compactCandidate(candidate) {
     edgeAligned: candidate.edgeAligned,
     accepted: candidate.accepted,
     filterFailures: candidate.filterFailures,
+    qualityWarnings: candidate.qualityWarnings || [],
     hardFailures: candidate.hardFailures || [],
     softFailures: candidate.softFailures || [],
     tradeBlockers: candidate.tradeBlockers || [],
