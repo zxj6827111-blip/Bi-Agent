@@ -116,6 +116,24 @@ App mode supports two delivery patterns:
 
 If you want the app to appear as a direct conversation in Feishu instead of posting into a group, do not use `chat_id`. Use a user identifier such as `open_id` instead.
 
+## Futures 急拉雷达（paper-only）
+
+独立雷达使用 Binance USD-M Futures WebSocket 连续监听全市场，目标发现延迟为 1-2 秒；`30 秒`只用于候选池、健康状态和持久化快照刷新，不是轮询扫描周期。候选进入观察后会动态订阅 `bookTicker`、`aggTrade` 和 `depth20`，并使用实时 ask/bid、滑点和双边手续费进行纸面成交。
+
+```powershell
+npm run monitor:radar
+```
+
+状态和事件分别写入：
+
+- `data/pump-radar/latest.json`：轻量实时状态；
+- `data/pump-radar/runtime.json`：容器健康检查；
+- `data/pump-radar/events-YYYY-MM-DD.ndjson`：按日分片事件。
+
+Web 服务启动后可通过 `GET /api/radar/status` 查看雷达健康、候选、纸面持仓和最近退出。Gate 与 Bitget 只用于跨交易所方向确认，不能替代 Binance 的成交价格。雷达不接收交易 API Key，也不会自动下单。
+
+NAS 配置、验收和回滚见 [deploy/PUMP-RADAR-GUIDE.md](deploy/PUMP-RADAR-GUIDE.md)。
+
 ## Docker on NAS
 
 Build and run:

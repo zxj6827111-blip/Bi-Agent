@@ -46,7 +46,38 @@ services:
       retries: 3
       start_period: 2m
 
-  # ---- Web UI（用于查看实时状态，含 Monitor 数据面板）----
+  # ---- Futures 急拉雷达：连续 WebSocket 发现，严格 paper-only ----
+  bi-agent-radar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bi-agent-radar
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      START_MODE: radar
+      PUMP_RADAR_DURATION_SECONDS: 0
+      PUMP_RADAR_OUTPUT_DIR: /app/data/pump-radar
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pgrep -f '[p]umpRadarMonitor.js' >/dev/null &&
+          node -e "const fs=require('fs');const p='/app/data/pump-radar/runtime.json';if(!fs.existsSync(p)||Date.now()-fs.statSync(p).mtimeMs>90000)process.exit(1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+
+  # ---- Web UI（用于查看实时状态，含 Monitor 和 Radar 状态接口）----
   bi-agent-server:
     build:
       context: .

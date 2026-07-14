@@ -20,6 +20,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const publicDir = join(__dirname, "..", "public");
 const dataDir = join(__dirname, "..", "data");
 const monitorOutputDir = process.env.FORMAL_MONITOR_OUTPUT_DIR || join(dataDir, "formal-signal-monitor");
+const radarOutputDir = process.env.PUMP_RADAR_OUTPUT_DIR || join(dataDir, "pump-radar");
 
 const mime = {
   ".html": "text/html; charset=utf-8",
@@ -126,6 +127,10 @@ const server = createServer(async (req, res) => {
       const session = await getMonitorSession(file);
       if (!session) return sendJson(res, { ok: false, error: "Monitor session not found" }, 404);
       return sendJson(res, { ok: true, session });
+    }
+
+    if (url.pathname === "/api/radar/status" && req.method === "GET") {
+      return sendJson(res, { ok: true, radar: await getRadarStatus() });
     }
 
     if (url.pathname.startsWith("/api/")) {
@@ -280,5 +285,44 @@ async function getMonitorSession(file) {
     return JSON.parse(await readFile(path, "utf8"));
   } catch {
     return null;
+  }
+}
+
+async function getRadarStatus() {
+  const latestPath = join(radarOutputDir, "latest.json");
+  if (!existsSync(latestPath)) {
+    return { available: false, message: "Pump radar data not found" };
+  }
+  try {
+    const data = JSON.parse(await readFile(latestPath, "utf8"));
+    const updatedAtMs = Date.parse(data.updatedAt || "");
+    return {
+      available: true,
+      stale: !Number.isFinite(updatedAtMs) || Date.now() - updatedAtMs > 90_000,
+      mode: data.mode || "unknown",
+      status: data.status || "unknown",
+      startedAt: data.startedAt || null,
+      updatedAt: data.updatedAt || null,
+      finishedAt: data.finishedAt || null,
+      policy: data.policy || null,
+      health: data.health || null,
+      metrics: data.metrics || null,
+      universe: {
+        totalPerpetualUsdt: data.universe?.totalPerpetualUsdt || 0,
+        streamDiscoveredSymbols: data.universe?.streamDiscoveredSymbols || 0,
+        liquidSymbols: data.universe?.liquidSymbols || 0,
+        metadataSource: data.universe?.metadataSource || null,
+        lastMetadataRefreshAt: data.universe?.lastMetadataRefreshAt || null,
+        lastCandidateRefreshAt: data.universe?.lastCandidateRefreshAt || null
+      },
+      candidates: (data.candidates || []).slice(0, 20),
+      positions: (data.positions || []).slice(0, 20),
+      trades: (data.trades || []).slice(-50),
+      summary: data.summary || null,
+      recentEvents: (data.recentEvents || []).slice(-30),
+      errors: (data.errors || []).slice(-10)
+    };
+  } catch (error) {
+    return { available: false, message: "Failed to read pump radar data", error: error.message };
   }
 }

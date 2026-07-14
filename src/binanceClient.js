@@ -1,4 +1,5 @@
 import { normalizeKlines } from "./indicators.js";
+import { MarketMetadataCache } from "./marketData/marketMetadataCache.js";
 
 class BinanceError extends Error {
   constructor(message, details = {}) {
@@ -8,7 +9,7 @@ class BinanceError extends Error {
   }
 }
 
-async function requestJson(baseUrl, path, params = {}, { timeoutMs = 8_000 } = {}) {
+async function requestJson(baseUrl, path, params = {}, { timeoutMs = 8_000, attempt = 1 } = {}) {
   const url = new URL(path, baseUrl);
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== null) url.searchParams.set(key, value);
@@ -16,6 +17,7 @@ async function requestJson(baseUrl, path, params = {}, { timeoutMs = 8_000 } = {
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
   let response;
   try {
     response = await fetch(url, {
@@ -31,7 +33,11 @@ async function requestJson(baseUrl, path, params = {}, { timeoutMs = 8_000 } = {
       : error.cause?.code || error.cause?.message || error.message;
     throw new BinanceError(`Binance API request failed: ${cause}`, {
       url: url.toString(),
-      cause
+      path,
+      cause,
+      attempt,
+      elapsedMs: Date.now() - startedAt,
+      retryable: isRetryableCause(cause)
     });
   } finally {
     clearTimeout(timeout);
@@ -41,7 +47,12 @@ async function requestJson(baseUrl, path, params = {}, { timeoutMs = 8_000 } = {
     const body = await response.text().catch(() => "");
     throw new BinanceError(`Binance API ${response.status} ${response.statusText}`, {
       url: url.toString(),
-      body: body.slice(0, 500)
+      path,
+      status: response.status,
+      body: body.slice(0, 500),
+      attempt,
+      elapsedMs: Date.now() - startedAt,
+      retryable: isRetryableStatus(response.status)
     });
   }
 
@@ -51,53 +62,109 @@ async function requestJson(baseUrl, path, params = {}, { timeoutMs = 8_000 } = {
 async function requestJsonWithFallback(baseUrls, path, params = {}, options = {}) {
   const urls = normalizeBaseUrls(baseUrls);
   const errors = [];
+  const retryCount = Math.max(0, Number(options.retryCount || 0));
+  const retryBaseDelayMs = Math.max(0, Number(options.retryBaseDelayMs || 0));
+  const startedAt = Date.now();
 
-  for (const baseUrl of urls) {
-    try {
-      return await requestJson(baseUrl, path, params, options);
-    } catch (error) {
-      errors.push({
-        baseUrl,
-        message: error.message,
-        cause: error.details?.cause,
-        status: error.details?.status,
-        url: error.details?.url
-      });
+  for (let attempt = 1; attempt <= retryCount + 1; attempt += 1) {
+    let retryableFailure = false;
+    for (const baseUrl of urls) {
+      try {
+        return await requestJson(baseUrl, path, params, { ...options, attempt });
+      } catch (error) {
+        const retryable = Boolean(error.details?.retryable);
+        retryableFailure ||= retryable;
+        errors.push({
+          baseUrl,
+          attempt,
+          message: error.message,
+          cause: error.details?.cause,
+          status: error.details?.status,
+          elapsedMs: error.details?.elapsedMs,
+          retryable,
+          url: error.details?.url
+        });
+      }
     }
+    if (!retryableFailure || attempt > retryCount) break;
+    await delay(retryBaseDelayMs * (2 ** (attempt - 1)));
   }
 
   throw new BinanceError(
-    `Binance API request failed for all endpoints: ${errors.map((item) => `${item.baseUrl} ${item.cause || item.message}`).join("; ")}`,
-    { path, params, errors }
+    `Binance API request failed path=${path} attempts=${Math.max(...errors.map((item) => item.attempt), 0)} elapsed=${Date.now() - startedAt}ms: ${errors.map((item) => `${item.baseUrl}#${item.attempt} ${item.cause || item.status || item.message} (${item.elapsedMs ?? "?"}ms)`).join("; ")}`,
+    { path, params, elapsedMs: Date.now() - startedAt, errors }
   );
 }
 
 export class BinanceClient {
-  constructor({ spotBaseUrl, futuresBaseUrl, spotBaseUrls, futuresBaseUrls, requestTimeoutMs = 8_000 }) {
+  constructor({
+    spotBaseUrl,
+    futuresBaseUrl,
+    spotBaseUrls,
+    futuresBaseUrls,
+    requestTimeoutMs = 8_000,
+    requestRetryCount = 1,
+    requestRetryBaseDelayMs = 250,
+    metadataCacheMs = 6 * 60 * 60_000,
+    metadataStaleMs = 24 * 60 * 60_000
+  }) {
     this.spotBaseUrls = normalizeBaseUrls(spotBaseUrls || spotBaseUrl);
     this.futuresBaseUrls = normalizeBaseUrls(futuresBaseUrls || futuresBaseUrl);
     this.spotBaseUrl = this.spotBaseUrls[0];
     this.futuresBaseUrl = this.futuresBaseUrls[0];
     this.requestTimeoutMs = requestTimeoutMs;
+    this.requestRetryCount = requestRetryCount;
+    this.requestRetryBaseDelayMs = requestRetryBaseDelayMs;
     this.futuresMetricsCache = new Map();
+    this.metadataCache = new MarketMetadataCache({ ttlMs: metadataCacheMs, staleMs: metadataStaleMs });
+    this.health = {
+      spot: createRequestHealth(),
+      futures: createRequestHealth(),
+      metadata: {}
+    };
   }
 
   async getSpotSymbols() {
-    const exchange = await this.requestSpot("/api/v3/exchangeInfo");
-    const tickers = await this.requestSpot("/api/v3/ticker/24hr");
-    const books = await this.requestSpot("/api/v3/ticker/bookTicker");
+    const [exchange, tickers, books] = await Promise.all([
+      this.getExchangeInfo("spot"),
+      this.requestSpot("/api/v3/ticker/24hr"),
+      this.requestSpot("/api/v3/ticker/bookTicker")
+    ]);
     return mergeMarketData("spot", exchange.symbols, tickers, books);
   }
 
   async getFuturesSymbols() {
-    const exchange = await this.requestFutures("/fapi/v1/exchangeInfo");
-    const tickers = await this.requestFutures("/fapi/v1/ticker/24hr");
-    const books = await this.requestFutures("/fapi/v1/ticker/bookTicker");
-    const premium = await this.requestFutures("/fapi/v1/premiumIndex");
+    const [exchange, tickers, books, premium] = await Promise.all([
+      this.getExchangeInfo("futures"),
+      this.requestFutures("/fapi/v1/ticker/24hr"),
+      this.requestFutures("/fapi/v1/ticker/bookTicker"),
+      this.requestFutures("/fapi/v1/premiumIndex")
+    ]);
     const fundingBySymbol = new Map(
       premium.map((item) => [item.symbol, Number(item.lastFundingRate || 0)])
     );
     return mergeMarketData("futures", exchange.symbols, tickers, books, fundingBySymbol);
+  }
+
+  async getExchangeInfo(marketType, { force = false } = {}) {
+    const path = marketType === "spot" ? "/api/v3/exchangeInfo" : "/fapi/v1/exchangeInfo";
+    const result = await this.metadataCache.getOrLoad(
+      `${marketType}:exchangeInfo`,
+      () => this.requestMarket(marketType, path),
+      { force }
+    );
+    this.health.metadata[marketType] = {
+      source: result.source,
+      stale: result.stale,
+      loadedAt: new Date(result.loadedAt).toISOString(),
+      ageMs: result.ageMs,
+      fallbackError: result.fallbackError?.message || null
+    };
+    return result.value;
+  }
+
+  getHealth() {
+    return structuredClone(this.health);
   }
 
   async getKlines(marketType, symbol, interval, limit = 120, options = {}) {
@@ -211,16 +278,71 @@ export class BinanceClient {
   }
 
   requestSpot(path, params = {}) {
-    return requestJsonWithFallback(this.spotBaseUrls, path, params, { timeoutMs: this.requestTimeoutMs });
+    return this.request("spot", this.spotBaseUrls, path, params);
   }
 
   requestFutures(path, params = {}) {
-    return requestJsonWithFallback(this.futuresBaseUrls, path, params, { timeoutMs: this.requestTimeoutMs });
+    return this.request("futures", this.futuresBaseUrls, path, params);
+  }
+
+  async request(marketType, baseUrls, path, params = {}) {
+    const startedAt = Date.now();
+    const health = this.health[marketType];
+    health.requestCount += 1;
+    health.lastPath = path;
+    try {
+      const value = await requestJsonWithFallback(baseUrls, path, params, {
+        timeoutMs: this.requestTimeoutMs,
+        retryCount: this.requestRetryCount,
+        retryBaseDelayMs: this.requestRetryBaseDelayMs
+      });
+      health.successCount += 1;
+      health.lastSuccessAt = new Date().toISOString();
+      health.lastDurationMs = Date.now() - startedAt;
+      health.lastError = null;
+      return value;
+    } catch (error) {
+      health.failureCount += 1;
+      health.lastFailureAt = new Date().toISOString();
+      health.lastDurationMs = Date.now() - startedAt;
+      health.lastError = {
+        message: error.message,
+        path,
+        elapsedMs: error.details?.elapsedMs ?? health.lastDurationMs,
+        attempts: error.details?.errors?.at(-1)?.attempt || 1
+      };
+      throw error;
+    }
   }
 
   requestMarket(marketType, path, params = {}) {
     return marketType === "spot" ? this.requestSpot(path, params) : this.requestFutures(path, params);
   }
+}
+
+function createRequestHealth() {
+  return {
+    requestCount: 0,
+    successCount: 0,
+    failureCount: 0,
+    lastPath: null,
+    lastSuccessAt: null,
+    lastFailureAt: null,
+    lastDurationMs: null,
+    lastError: null
+  };
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableCause(cause) {
+  return /timeout|timedout|econnreset|econnrefused|enotfound|fetch failed|socket/i.test(String(cause || ""));
+}
+
+function delay(ms) {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 }
 
 function normalizeBaseUrls(value) {

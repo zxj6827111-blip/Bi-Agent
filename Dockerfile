@@ -5,10 +5,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=4173
-# START_MODE: server (Web UI) | monitor (纸面交易监控) | both (同时启动)
+# START_MODE: server | monitor | radar | both | all
 ENV START_MODE=monitor
 
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+
 COPY src ./src
 COPY public ./public
 COPY scripts ./scripts

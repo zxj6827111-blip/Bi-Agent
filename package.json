@@ -9,7 +9,11 @@
     "replay": "node scripts/cryptoReplay.js",
     "paper:live": "node scripts/livePaperTrade.js",
     "monitor:formal": "node scripts/formalSignalPaperMonitor.js",
+    "monitor:radar": "node scripts/pumpRadarMonitor.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=24.0.0"
