@@ -200,12 +200,104 @@ export function isUnclosedCandle(candle, nowMs = Date.now()) {
   return Number.isFinite(closeTime) && closeTime > nowMs;
 }
 
+export function adx(candles, period = 14) {
+  if (!Array.isArray(candles) || candles.length < period * 2) {
+    return { adx: null, plusDI: null, minusDI: null };
+  }
+
+  const trueRanges = [];
+  const plusDMs = [];
+  const minusDMs = [];
+
+  for (let i = 1; i < candles.length; i += 1) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    );
+    const upMove = current.high - previous.high;
+    const downMove = previous.low - current.low;
+    const plusDM = upMove > downMove && upMove > 0 ? upMove : 0;
+    const minusDM = downMove > upMove && downMove > 0 ? downMove : 0;
+    trueRanges.push(tr);
+    plusDMs.push(plusDM);
+    minusDMs.push(minusDM);
+  }
+
+  // Smoothed TR, +DM, -DM using Wilder's smoothing
+  let smoothTR = trueRanges.slice(0, period).reduce((a, b) => a + b, 0);
+  let smoothPlusDM = plusDMs.slice(0, period).reduce((a, b) => a + b, 0);
+  let smoothMinusDM = minusDMs.slice(0, period).reduce((a, b) => a + b, 0);
+
+  const dxValues = [];
+  let latestPlusDI = 0;
+  let latestMinusDI = 0;
+  const appendDx = () => {
+    latestPlusDI = smoothTR > 0 ? (smoothPlusDM / smoothTR) * 100 : 0;
+    latestMinusDI = smoothTR > 0 ? (smoothMinusDM / smoothTR) * 100 : 0;
+    const diSum = latestPlusDI + latestMinusDI;
+    dxValues.push(diSum > 0 ? Math.abs(latestPlusDI - latestMinusDI) / diSum * 100 : 0);
+  };
+
+  appendDx();
+  for (let i = period; i < trueRanges.length; i += 1) {
+    smoothTR = smoothTR - smoothTR / period + trueRanges[i];
+    smoothPlusDM = smoothPlusDM - smoothPlusDM / period + plusDMs[i];
+    smoothMinusDM = smoothMinusDM - smoothMinusDM / period + minusDMs[i];
+    appendDx();
+  }
+
+  if (dxValues.length < period) return { adx: null, plusDI: null, minusDI: null };
+
+  let adxValue = dxValues.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  for (let i = period; i < dxValues.length; i += 1) {
+    adxValue = ((adxValue * (period - 1)) + dxValues[i]) / period;
+  }
+
+  return {
+    adx: round(adxValue, 2),
+    plusDI: round(latestPlusDI, 2),
+    minusDI: round(latestMinusDI, 2)
+  };
+}
+
 export function volumeRatio(candles, period = 20) {
   if (candles.length < period + 1) return null;
   const previous = candles.slice(-(period + 1), -1).map((candle) => candle.volume);
   const base = mean(previous);
   if (!base) return null;
   return candles[candles.length - 1].volume / base;
+}
+
+export function vwap(candles) {
+  if (!candles || !candles.length) return { vwap: null, upperBand: null, lowerBand: null, upperBand2: null, lowerBand2: null };
+  let cumulativePV = 0;
+  let cumulativeVolume = 0;
+  for (const candle of candles) {
+    const typicalPrice = (candle.high + candle.low + candle.close) / 3;
+    const vol = candle.volume;
+    cumulativePV += typicalPrice * vol;
+    cumulativeVolume += vol;
+  }
+  if (!cumulativeVolume) return { vwap: null, upperBand: null, lowerBand: null, upperBand2: null, lowerBand2: null };
+  const vwapValue = cumulativePV / cumulativeVolume;
+  // Standard deviation bands
+  let sumSqDiff = 0;
+  for (const candle of candles) {
+    const typicalPrice = (candle.high + candle.low + candle.close) / 3;
+    const vol = candle.volume;
+    sumSqDiff += vol * (typicalPrice - vwapValue) ** 2;
+  }
+  const stdDev = Math.sqrt(sumSqDiff / cumulativeVolume);
+  return {
+    vwap: round(vwapValue, 8),
+    upperBand: round(vwapValue + stdDev, 8),
+    lowerBand: round(vwapValue - stdDev, 8),
+    upperBand2: round(vwapValue + stdDev * 2, 8),
+    lowerBand2: round(vwapValue - stdDev * 2, 8)
+  };
 }
 
 export function normalizeKlines(rows) {

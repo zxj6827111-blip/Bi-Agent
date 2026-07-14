@@ -43,7 +43,23 @@ export function buildFormalSafetyFailures(candidate, options = {}) {
     if (rewardRisk + epsilon < minRewardRisk) failures.push("reward_risk");
   }
 
+  // Phase 2.1: ADX < 15 + volume < 1.0 时增加 low_trend_strength 失败
+  // candidate.adx 是数值（snapshot.indicators.adx），非对象
+  const adxValue = candidate?.adx == null ? null : Number(candidate.adx);
+  const volumeRatio = Number(candidate?.volumeRatio);
+  if (Number.isFinite(adxValue) && adxValue < 15 && Number.isFinite(volumeRatio) && volumeRatio < 1.0) {
+    failures.push("low_trend_strength");
+  }
+
   return failures;
+}
+
+export function allowsRiskOffShortEntry(candidate, { executionMinEdge = 0 } = {}) {
+  return candidate?.side === "short"
+    && candidate?.marketRegime?.bias === "risk_off"
+    && ["down", "weakening"].includes(candidate?.trend)
+    && Boolean(candidate?.technicalAligned)
+    && Number(candidate?.edgeAligned || 0) >= Number(executionMinEdge || 0);
 }
 
 export function updateSignalConfirmations(confirmations, candidates, {

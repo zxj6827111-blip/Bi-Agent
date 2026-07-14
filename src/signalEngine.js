@@ -1,4 +1,5 @@
 import {
+  adx,
   atr,
   bollingerBands,
   closedCandles,
@@ -7,7 +8,8 @@ import {
   sma,
   summarizeIndicatorState,
   supportResistance,
-  volumeRatio
+  volumeRatio,
+  vwap
 } from "./indicators.js";
 import { directionBlocksSignal, directionScoreAdjustment } from "./directionEngine.js";
 import { fusionBlocksSignal, fusionScoreAdjustment } from "./marketFusion.js";
@@ -88,6 +90,8 @@ export function buildMarketSnapshot({ market, interval, candles, nowMs = Date.no
   const sma50 = sma(closes, 50);
   const volRatio = volumeRatio(finalizedCandles);
   const bollinger = bollingerBands(closes);
+  const adxValue = adx(finalizedCandles);
+  const vwapValue = vwap(finalizedCandles);
   const indicatorState = summarizeIndicatorState({ closes, candles: finalizedCandles, macdValue, rsiValue, bollinger, atrValue });
   const changeFromPrevious = previous.close ? ((latest.close - previous.close) / previous.close) * 100 : 0;
   const resistanceDistance = sr.resistance ? ((sr.resistance - latest.close) / latest.close) * 100 : null;
@@ -140,7 +144,10 @@ export function buildMarketSnapshot({ market, interval, candles, nowMs = Date.no
       bollingerMiddle: round(bollinger.middle),
       bollingerLower: round(bollinger.lower),
       bollingerBandwidthPercent: round(bollinger.bandwidthPercent, 2),
-      bollingerPercentB: round(bollinger.percentB, 3)
+      bollingerPercentB: round(bollinger.percentB, 3),
+      adx: adxValue.adx,
+      adxPlusDI: adxValue.plusDI,
+      adxMinusDI: adxValue.minusDI
     },
     indicatorState,
     technicalConsensus,
@@ -150,6 +157,7 @@ export function buildMarketSnapshot({ market, interval, candles, nowMs = Date.no
       supportDistancePercent: round(supportDistance, 2),
       resistanceDistancePercent: round(resistanceDistance, 2)
     },
+    vwap: vwapValue,
     trend,
     volatilityPercent: atrValue && latest.close ? round((atrValue / latest.close) * 100, 2) : null,
     candleChangePercent: round(changeFromPrevious, 2)
@@ -281,7 +289,7 @@ export function generateSignalsFromSnapshot(snapshot) {
     const sellScore = scoreSellSetup({ snapshot, rsiValue, volume, histogram })
       + fusionScoreAdjustment(snapshot.fusion, "spot_sell", snapshot)
       + directionScoreAdjustment(snapshot.directionAnalysis, "spot_sell");
-    if (sellScore >= 62) {
+    if (sellScore >= 58) {
       signals.push(makeSignal({
         snapshot,
         direction: "spot_sell",
@@ -603,8 +611,8 @@ function inspectSpotSellRisks(signal, confirmation) {
     problems.push("现货卖出遇到高周期明确上行，减仓优势不足");
   }
 
-  if (!hasHigherBearStructure && priceChangePercent24h > -1.5) {
-    problems.push(`高周期尚未转弱且 24h 跌幅 ${round(priceChangePercent24h, 2)}% 不足，卖出信号过早`);
+  if (!hasHigherBearStructure && !(snapshot.trend === "down" || snapshot.trend === "weakening")) {
+    problems.push(`高周期尚未转弱且当前周期趋势未确认下行`);
   }
 
   if (Number.isFinite(supportDistance) && supportDistance < 1.5) {
@@ -615,8 +623,8 @@ function inspectSpotSellRisks(signal, confirmation) {
     problems.push(`24h 跌幅 ${round(priceChangePercent24h, 2)}% 已偏深，避免低位追卖`);
   }
 
-  if (Number.isFinite(rsiValue) && rsiValue < 45) {
-    problems.push(`RSI ${round(rsiValue, 2)} 不够偏弱或偏热，卖出优势不足`);
+  if (Number.isFinite(rsiValue) && rsiValue < 25) {
+    problems.push(`RSI ${round(rsiValue, 2)} 已严重超卖，追空风险偏高（警告）`);
   }
 
   if (volumeRatio < 1.2) {
@@ -739,7 +747,7 @@ function scoreLongSetup({ snapshot, rsiValue, volume, histogram }) {
 }
 
 function scoreSellSetup({ snapshot, rsiValue, volume, histogram }) {
-  let score = 38;
+  let score = 42;
   if (snapshot.trend === "weakening") score += 12;
   if (snapshot.trend === "down") score += 16;
   if (rsiValue >= 70) score += 15;

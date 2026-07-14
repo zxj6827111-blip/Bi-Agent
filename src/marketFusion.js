@@ -124,6 +124,48 @@ export function buildMarketFusion({ market, spotMarket = null, futuresMarket = n
   };
 }
 
+export function fundingRateSignal(fundingRate, side, prevFundingRate = null) {
+  if (!Number.isFinite(fundingRate)) {
+    return { signal: "unavailable", score: 0, label: null };
+  }
+  const fundingBps = fundingRate * 10000; // Convert to basis points
+  const isLong = side === "long" || side === "spot_buy";
+
+  // Phase 2.4: 资金费率方向切换检测
+  let directionChangeScore = 0;
+  let directionChangeLabel = null;
+  if (Number.isFinite(prevFundingRate)) {
+    const prevBps = prevFundingRate * 10000;
+    if (prevBps > 0 && fundingBps <= 0) {
+      // 资金费率从正转负 → 市场情绪切换 → 做多加分
+      directionChangeScore = isLong ? 5 : -5;
+      directionChangeLabel = `资金费率从正转负(${fundingBps.toFixed(1)}bps)，${isLong ? "空头拥挤风险上升，做多加分" : "空头拥挤风险上升，做空减分"}`;
+    } else if (prevBps < 0 && fundingBps >= 0) {
+      // 资金费率从负转正 → 市场情绪切换 → 做空加分
+      directionChangeScore = isLong ? -5 : 5;
+      directionChangeLabel = `资金费率从负转正(${fundingBps.toFixed(1)}bps)，${isLong ? "多头拥挤风险上升，做多减分" : "多头拥挤风险上升，做空加分"}`;
+    }
+  }
+
+  let levelScore = 0;
+  let levelSignal = "neutral";
+  let levelLabel = null;
+
+  if (isLong) {
+    if (fundingBps > 5) { levelSignal = "crowded_long"; levelScore = -5; levelLabel = `资金费率 ${(fundingBps).toFixed(1)}bps，多头极度拥挤`; }
+    else if (fundingBps > 2) { levelSignal = "elevated_long"; levelScore = -3; levelLabel = `资金费率 ${(fundingBps).toFixed(1)}bps，多头偏拥挤`; }
+    else if (fundingBps < -2) { levelSignal = "short_squeeze"; levelScore = 3; levelLabel = `负资金费率 ${(fundingBps).toFixed(1)}bps，空头挤压`; }
+  } else {
+    if (fundingBps < -5) { levelSignal = "crowded_short"; levelScore = -5; levelLabel = `资金费率 ${(fundingBps).toFixed(1)}bps，空头极度拥挤`; }
+    else if (fundingBps < -2) { levelSignal = "elevated_short"; levelScore = -3; levelLabel = `资金费率 ${(fundingBps).toFixed(1)}bps，空头偏拥挤`; }
+    else if (fundingBps > 2) { levelSignal = "long_squeeze"; levelScore = 3; levelLabel = `正资金费率 ${(fundingBps).toFixed(1)}bps，多头挤压`; }
+  }
+
+  const totalScore = levelScore + directionChangeScore;
+  const combinedLabel = [levelLabel, directionChangeLabel].filter(Boolean).join("; ");
+  return { signal: levelSignal, score: totalScore, label: combinedLabel || null };
+}
+
 export function fusionScoreAdjustment(fusion, direction, snapshot = {}) {
   if (!fusion) return 0;
   const bias = direction === "spot_buy" || direction === "long" ? "long" : "short";
@@ -260,6 +302,7 @@ function normalizeDerivatives(value = null, market = null) {
     openInterest: finiteNumber(value.openInterest),
     openInterestValue: finiteNumber(value.openInterestValue),
     openInterestChangePercent: finiteNumber(value.openInterestChangePercent),
+    period: value.period || null,
     fundingRate: finiteNumber(value.fundingRate ?? market?.fundingRate),
     nextFundingTime: finiteNumber(value.nextFundingTime),
     longShortAccountRatio: finiteNumber(value.longShortAccountRatio),

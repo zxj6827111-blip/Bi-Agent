@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { enrichMarketWithFusion, fusionBlocksSignal, fusionScoreAdjustment } from "../src/marketFusion.js";
+import { enrichMarketWithFusion, fundingRateSignal, fusionBlocksSignal, fusionScoreAdjustment } from "../src/marketFusion.js";
+
+test("funding rate direction changes score long and short in opposite directions", () => {
+  assert.equal(fundingRateSignal(-0.0001, "long", 0.0001).score, 5);
+  assert.equal(fundingRateSignal(-0.0001, "short", 0.0001).score, -5);
+  assert.equal(fundingRateSignal(0.0001, "long", -0.0001).score, -5);
+  assert.equal(fundingRateSignal(0.0001, "short", -0.0001).score, 5);
+});
 
 test("market fusion rewards aligned futures long context", () => {
   const market = enrichMarketWithFusion({

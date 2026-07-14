@@ -34,7 +34,7 @@ export function buildPositionRiskPlan(candidate, {
   };
 }
 
-export function calculatePortfolioRiskMetrics(trades = [], { nowMs = Date.now() } = {}) {
+export function calculatePortfolioRiskMetrics(trades = [], { nowMs = Date.now(), timeZone = "UTC" } = {}) {
   const closed = trades
     .filter((trade) => trade?.status === "closed")
     .sort((a, b) => Date.parse(a.closedAt || "") - Date.parse(b.closedAt || ""));
@@ -48,10 +48,9 @@ export function calculatePortfolioRiskMetrics(trades = [], { nowMs = Date.now() 
     maxDrawdown = Math.max(maxDrawdown, peak - equity);
   }
 
-  const dayStart = new Date(nowMs);
-  dayStart.setUTCHours(0, 0, 0, 0);
+  const currentDay = dateKeyInTimeZone(nowMs, timeZone);
   const dailyReturn = closed
-    .filter((trade) => Date.parse(trade.closedAt || "") >= dayStart.getTime())
+    .filter((trade) => dateKeyInTimeZone(Date.parse(trade.closedAt || ""), timeZone) === currentDay)
     .reduce((sum, trade) => sum + realizedAccountReturnPercent(trade), 0);
 
   return {
@@ -62,6 +61,18 @@ export function calculatePortfolioRiskMetrics(trades = [], { nowMs = Date.now() 
     maxDrawdownPercent: round(maxDrawdown, 4),
     dailyAccountReturnPercent: round(dailyReturn, 4)
   };
+}
+
+function dateKeyInTimeZone(timestamp, timeZone) {
+  if (!Number.isFinite(timestamp)) return null;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
 }
 
 export function portfolioEntryBlockers({

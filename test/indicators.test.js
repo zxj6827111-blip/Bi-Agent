@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { atr, bollingerBands, macd, normalizeKlines, rsi, supportResistance } from "../src/indicators.js";
+import { adx, atr, bollingerBands, macd, normalizeKlines, rsi, supportResistance, vwap } from "../src/indicators.js";
 
 test("normalizeKlines converts Binance rows into numeric candles", () => {
   const candles = normalizeKlines([
@@ -34,4 +34,28 @@ test("technical indicators return stable numeric values", () => {
   assert.equal(typeof bollingerBands(values).upper, "number");
   assert.equal(typeof atr(candles), "number");
   assert.ok(supportResistance(candles).resistance > supportResistance(candles).support);
+});
+
+test("ADX is available at the minimum Wilder window and preserves trend direction", () => {
+  const candles = Array.from({ length: 28 }, (_, index) => ({
+    open: 100 + index,
+    high: 102 + index,
+    low: 99 + index,
+    close: 101 + index,
+    volume: 1000
+  }));
+  const result = adx(candles, 14);
+  assert.equal(typeof result.adx, "number");
+  assert.ok(result.plusDI > result.minusDI);
+});
+
+test("VWAP returns volume-weighted bands and handles zero volume", () => {
+  const result = vwap([
+    { high: 11, low: 9, close: 10, volume: 1 },
+    { high: 21, low: 19, close: 20, volume: 3 }
+  ]);
+  assert.equal(result.vwap, 17.5);
+  assert.ok(result.upperBand > result.vwap);
+  assert.ok(result.lowerBand < result.vwap);
+  assert.equal(vwap([{ high: 1, low: 1, close: 1, volume: 0 }]).vwap, null);
 });

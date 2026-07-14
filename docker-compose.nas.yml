@@ -34,9 +34,13 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
-    # 健康检查：每 5 分钟检测进程是否存活
+    # 同时检查真实监控进程和 runtime checkpoint 新鲜度，避免 pgrep 匹配自身。
     healthcheck:
-      test: ["CMD", "sh", "-c", "pgrep -f formalSignalPaperMonitor || exit 1"]
+      test:
+        - CMD-SHELL
+        - >-
+          pgrep -f '[f]ormalSignalPaperMonitor.js' >/dev/null &&
+          node -e "const fs=require('fs');const p='/app/data/formal-signal-monitor/runtime.json';if(!fs.existsSync(p)||Date.now()-fs.statSync(p).mtimeMs>600000)process.exit(1)"
       interval: 5m
       timeout: 10s
       retries: 3

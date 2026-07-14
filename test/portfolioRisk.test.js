@@ -43,6 +43,19 @@ test("calculatePortfolioRiskMetrics measures peak-to-trough account drawdown", (
   assert.equal(metrics.dailyAccountReturnPercent, -0.5);
 });
 
+test("daily portfolio risk follows the configured monitor timezone", () => {
+  const trades = [
+    closedTrade("2026-07-13T15:59:59.000Z", -1),
+    closedTrade("2026-07-13T16:00:00.000Z", -2)
+  ];
+  const metrics = calculatePortfolioRiskMetrics(trades, {
+    nowMs: Date.parse("2026-07-13T17:00:00.000Z"),
+    timeZone: "Asia/Shanghai"
+  });
+
+  assert.equal(metrics.dailyAccountReturnPercent, -2);
+});
+
 test("portfolioEntryBlockers limits same-side concentration and total open risk", () => {
   const positions = [
     { side: "long", accountRiskPercent: 0.5, positionSizePercentOfEquity: 30 },

@@ -3,10 +3,46 @@ import assert from "node:assert/strict";
 import {
   buildDirectionAnalysis,
   buildMarketRegime,
+  computeCVD,
+  computeOIDivergence,
   directionBlocksSignal,
   directionScoreAdjustment,
   enrichMarketWithDirection
 } from "../src/directionEngine.js";
+
+test("computeOIDivergence uses positive scores for bullish bias and negative scores for bearish bias", () => {
+  assert.equal(computeOIDivergence(3, 2).score, 8);
+  assert.equal(computeOIDivergence(3, -2).score, -8);
+  assert.equal(computeOIDivergence(-3, 2).score, -8);
+  assert.equal(computeOIDivergence(-3, -2).score, 5);
+});
+
+test("computeCVD normalizes order flow and keeps a stable empty result contract", () => {
+  const now = Date.now();
+  assert.deepEqual(computeCVD([]), { cvd: 0, cvdPerMinute: 0, score: 0, divergence: "neutral" });
+  const result = computeCVD([
+    { side: "buy", quoteQuantity: 75, time: now - 2000 },
+    { side: "sell", quoteQuantity: 25, time: now - 1000 },
+    { side: "invalid", quoteQuantity: 999, time: now }
+  ]);
+  assert.equal(result.cvd, 50);
+  assert.equal(result.score, 50);
+});
+
+test("computeCVD only reports divergence when price and order flow disagree", () => {
+  const now = Date.now();
+  const bullishDivergence = computeCVD([
+    { side: "sell", quoteQuantity: 100, price: 102, time: now - 240_000 },
+    { side: "buy", quoteQuantity: 120, price: 100, time: now - 10_000 }
+  ]);
+  const noDivergence = computeCVD([
+    { side: "sell", quoteQuantity: 100, price: 100, time: now - 240_000 },
+    { side: "buy", quoteQuantity: 120, price: 102, time: now - 10_000 }
+  ]);
+
+  assert.equal(bullishDivergence.divergence, "bullish_reversal");
+  assert.equal(noDivergence.divergence, "bullish");
+});
 
 test("direction engine marks aligned order flow and market regime as up", () => {
   const regime = buildMarketRegime({

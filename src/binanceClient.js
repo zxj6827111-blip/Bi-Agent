@@ -202,6 +202,7 @@ export class BinanceClient {
       longAccountPercent: finiteOrNull(Number(latestAccountRatio?.longAccount)),
       shortAccountPercent: finiteOrNull(Number(latestAccountRatio?.shortAccount)),
       topLongShortPositionRatio: finiteOrNull(Number(latestPositionRatio?.longShortRatio)),
+      period,
       errors: errors.slice(0, 3)
     };
 

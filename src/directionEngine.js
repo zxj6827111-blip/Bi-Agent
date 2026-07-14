@@ -4,6 +4,83 @@ import { clamp, round } from "./utils.js";
 const LONG_DIRECTIONS = new Set(["spot_buy", "long"]);
 const SHORT_DIRECTIONS = new Set(["spot_sell", "short"]);
 
+// Phase 2.2: CVD 累积成交量差计算
+export function computeCVD(aggressiveTrades = [], lookbackMs = 300_000) {
+  if (!Array.isArray(aggressiveTrades) || !aggressiveTrades.length) {
+    return { cvd: 0, cvdPerMinute: 0, score: 0, divergence: "neutral" };
+  }
+  const cutoff = Date.now() - lookbackMs;
+  let cvd = 0;
+  let recentCvd = 0;
+  let earlyCvd = 0;
+  let totalNotional = 0;
+  let firstPrice = null;
+  let lastPrice = null;
+  const midpoint = cutoff + lookbackMs / 2;
+  for (const trade of aggressiveTrades) {
+    const tradeTime = Number(trade.time || 0);
+    if (tradeTime < cutoff) continue;
+    const quoteQuantity = Number(trade.quoteQuantity);
+    if (!["buy", "sell"].includes(trade.side) || !Number.isFinite(quoteQuantity) || quoteQuantity <= 0) continue;
+    const price = Number(trade.price);
+    if (Number.isFinite(price) && price > 0) {
+      if (firstPrice == null) firstPrice = price;
+      lastPrice = price;
+    }
+    const delta = trade.side === "buy" ? quoteQuantity : -quoteQuantity;
+    cvd += delta;
+    totalNotional += quoteQuantity;
+    if (tradeTime >= midpoint) recentCvd += delta;
+    else earlyCvd += delta;
+  }
+  const totalMinutes = Math.max(lookbackMs / 60000, 1);
+  const cvdPerMinute = cvd / totalMinutes;
+  // 价格与订单流反向才构成背离；否则只报告净订单流方向。
+  const priceChange = firstPrice != null && lastPrice != null ? lastPrice - firstPrice : 0;
+  const cvdChange = recentCvd - earlyCvd;
+  const divergence = priceChange < 0 && cvdChange > 0
+    ? "bullish_reversal"
+    : priceChange > 0 && cvdChange < 0
+      ? "bearish_reversal"
+      : cvd > 0
+        ? "bullish"
+        : cvd < 0
+          ? "bearish"
+          : "neutral";
+  const score = totalNotional > 0 ? clamp(Math.round(cvd / totalNotional * 100), -100, 100) : 0;
+  return {
+    cvd: round(cvd, 2),
+    cvdPerMinute: round(cvdPerMinute, 2),
+    divergence,
+    score
+  };
+}
+
+// Phase 2.3: OI 背离检测
+export function computeOIDivergence(priceChange24h, oiChangePercent) {
+  if (!Number.isFinite(priceChange24h) || !Number.isFinite(oiChangePercent)) {
+    return { divergence: "unavailable", score: 0, label: null };
+  }
+  const priceUp = priceChange24h > 1;
+  const priceDown = priceChange24h < -1;
+  const oiUp = oiChangePercent > 0.5;
+  const oiDown = oiChangePercent < -0.5;
+
+  if (priceUp && oiDown) {
+    return { divergence: "bearish_divergence", score: -8, label: "价格涨+OI跌=多头减仓，上涨不可持续" };
+  }
+  if (priceDown && oiUp) {
+    return { divergence: "bearish_continuation", score: -8, label: "价格跌+OI涨=空头增仓，下跌可持续" };
+  }
+  if (priceDown && oiDown) {
+    return { divergence: "short_squeeze_risk", score: 5, label: "价格跌+OI跌=空头减仓，下跌衰竭" };
+  }
+  if (priceUp && oiUp) {
+    return { divergence: "bullish_continuation", score: 8, label: "价格涨+OI涨=多头增仓，上涨可持续" };
+  }
+  return { divergence: "neutral", score: 0, label: null };
+}
+
 export function buildMarketRegime({ spotMarkets = [], futuresMarkets = [], preferredMarketType = "auto" } = {}) {
   const source = preferredMarketType === "futures" && futuresMarkets.length
     ? futuresMarkets

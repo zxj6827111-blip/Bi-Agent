@@ -1,6 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildFormalSafetyFailures, updateSignalConfirmations } from "../src/formalSignalRules.js";
+import { allowsRiskOffShortEntry, buildFormalSafetyFailures, updateSignalConfirmations } from "../src/formalSignalRules.js";
+
+test("missing ADX data is not treated as a weak trend", () => {
+  const failures = buildFormalSafetyFailures({ adx: null, volumeRatio: 0.8 }, {});
+  assert.ok(!failures.includes("low_trend_strength"));
+});
+
+test("risk-off short entry path is reachable with aligned technical evidence", () => {
+  assert.equal(allowsRiskOffShortEntry({
+    side: "short",
+    marketRegime: { bias: "risk_off" },
+    trend: "down",
+    technicalAligned: true,
+    edgeAligned: 20
+  }, { executionMinEdge: 18 }), true);
+  assert.equal(allowsRiskOffShortEntry({
+    side: "short",
+    marketRegime: { bias: "risk_on" },
+    trend: "down",
+    technicalAligned: true,
+    edgeAligned: 20
+  }, { executionMinEdge: 18 }), false);
+});
 
 test("buildFormalSafetyFailures blocks chase, high volatility, and wide spread", () => {
   const failures = buildFormalSafetyFailures({

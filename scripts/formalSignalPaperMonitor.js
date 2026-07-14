@@ -2,22 +2,32 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { BinanceClient } from "../src/binanceClient.js";
 import { config } from "../src/config.js";
-import { buildMarketRegime, enrichMarketWithDirection } from "../src/directionEngine.js";
-import { buildFormalSafetyFailures, updateSignalConfirmations } from "../src/formalSignalRules.js";
+import { buildMarketRegime, computeCVD, computeOIDivergence, enrichMarketWithDirection } from "../src/directionEngine.js";
+import { allowsRiskOffShortEntry, buildFormalSafetyFailures, updateSignalConfirmations } from "../src/formalSignalRules.js";
 import { buildMarketSnapshot, filterTradableSymbols, generateSignalsFromSnapshot, reviewSignalsForQuality } from "../src/signalEngine.js";
-import { withMarketSource } from "../src/marketFusion.js";
+import { enrichMarketWithFusion, fundingRateSignal, withMarketSource } from "../src/marketFusion.js";
+import { applyFeedbackRecommendationsOnce, buildFeedbackLoop } from "../src/formalMonitorFeedback.js";
+import {
+  alignedOpenInterestChange,
+  carryOpenTradeState,
+  combineTradeRealizations,
+  derivativesPeriodForInterval,
+  executablePrice,
+  hardExitOutcome,
+  hourAdjustedOptions,
+  hourBiasAt
+} from "../src/formalMonitorPolicy.js";
 import {
   activeRiskGuard,
   buildPositionRiskPlan,
   calculatePortfolioRiskMetrics,
-  nextUtcDayIso,
   portfolioEntryBlockers,
   realizedAccountReturnPercent
 } from "../src/portfolioRisk.js";
 import { isFeishuEnabled, sendFeishuText } from "../src/feishuNotifier.js";
 import { summarizePerformance } from "../src/tradeMetrics.js";
 import { clamp, mapWithConcurrency, round, safeJsonParse, sleep } from "../src/utils.js";
-import { atomicWriteJson, sessionDateKey, sessionFileName } from "../src/monitorPersistence.js";
+import { atomicWriteJson, nextSessionDayIso, sessionDateKey, sessionFileName } from "../src/monitorPersistence.js";
 
 const client = new BinanceClient(config.binance);
 const defaultMaxChase24hPercent = readNumber("FORMAL_MONITOR_MAX_CHASE_24H_PERCENT", 18);
@@ -25,10 +35,11 @@ const defaultShadowProfiles = "balanced:minEdge=30,minNetTargetPercent=0.12;stri
 const defaultConfirmationIntervals = "1d";
 const monitorTimeframeWeight = { "1m": 1, "5m": 2, "15m": 3, "1h": 4, "4h": 5, "1d": 6 };
 const hardSafetyFailures = new Set(["chase24h", "volatility", "spread", "net_target", "reward_risk", "timeframe_conflict"]);
-const softSignalFailures = new Set(["edge", "score", "technical", "volume", "source_quality", "entry_quality", "timeframe_confirmation"]);
+const softSignalFailures = new Set(["edge", "score", "technical", "volume", "source_quality", "entry_quality", "timeframe_confirmation", "low_trend_strength"]);
 const CONSECUTIVE_STOP_PAUSE_MS = 2 * 60 * 60 * 1000;
-const CONSECUTIVE_STOP_TRIGGER = 3;
+const consecutiveStopTrigger = readInt("CONSECUTIVE_STOP_TRIGGER", 2);
 const pendingFeishuNotifications = new Set();
+
 let shutdownInProgress = false;
 
 const options = {
@@ -166,6 +177,10 @@ const state = {
     lastReviews: []
   },
   marketRegime: null,
+  hourBias: null,
+  hourAdjustedOptions: null,
+  previousFundingRates: {},
+  feedbackAdjustments: null,
   universe: {
     eligibleSpotMarkets: 0,
     analyzedMarkets: 0,
@@ -242,6 +257,7 @@ const state = {
 };
 
 restoreRuntimeState();
+applyFeedbackFromClosedTrades();
 rotateSessionIfNeeded();
 installShutdownCheckpoint();
 
@@ -261,7 +277,7 @@ async function runMonitor() {
 
   while (Date.now() < deadline) {
     rotateSessionIfNeeded();
-    if (Date.now() >= nextScanAt && state.trades.length < options.maxTotalTrades) {
+    if (Date.now() >= nextScanAt && primaryTradeCount() < options.maxTotalTrades) {
       await scanAndOpen();
       nextScanAt = Date.now() + options.scanSeconds * 1000;
       state.nextScanAt = new Date(nextScanAt).toISOString();
@@ -275,12 +291,12 @@ async function runMonitor() {
     await sleep(nextLoopSleepSeconds(deadline) * 1000);
   }
 
-  if (state.positions.length) {
-    await closeAllOpenPositions("timeout");
-  }
+  const closeResult = state.positions.length
+    ? await closeAllOpenPositions("timeout")
+    : { failedCount: 0 };
 
   await flushPendingFeishuNotifications();
-  state.status = "completed";
+  state.status = closeResult.failedCount ? "close_failed" : "completed";
   state.finishedAt = new Date().toISOString();
   state.summary = summarizeTrades(state.trades);
   persistState();
@@ -298,6 +314,17 @@ function nextLoopSleepSeconds(deadline) {
 async function scanAndOpen() {
   state.scanCount += 1;
   state.lastScanAt = new Date().toISOString();
+
+  // Phase 3.5: 应用时段效应自适应参数
+  const hourBias = getHourBias();
+  if (hourBias !== "normal") {
+    state.hourBias = hourBias;
+    state.hourAdjustedOptions = getHourAdjustedOptions();
+    console.log(`[formal-monitor][hour-bias] ${hourBias} adjustments=${JSON.stringify(state.hourAdjustedOptions)}`);
+  } else {
+    state.hourBias = null;
+    state.hourAdjustedOptions = null;
+  }
 
   try {
     const setup = await buildFormalCandidates();
@@ -381,7 +408,16 @@ async function scanAndOpen() {
 
     for (const candidate of riskPaused ? [] : candidatesForOpening) {
       if (state.positions.length >= options.maxOpenPositions) break;
-      const riskPlan = buildPositionRiskPlan(candidate, options);
+      // Phase 2.5: 波动率自适应头寸管理
+      // 基准 4h ATR 约 3%，高波动率时缩减头寸，低波动率时放大头寸
+      const effectiveOptions = getEffectiveOptions();
+      const baseAtr = 3;
+      const atrMultiplier = clamp(baseAtr / Math.max(candidate.atrPercent || baseAtr, 0.5), 0.4, 2.0);
+      const adjustedOptions = {
+        ...effectiveOptions,
+        accountRiskPerTradePercent: effectiveOptions.accountRiskPerTradePercent * atrMultiplier
+      };
+      const riskPlan = buildPositionRiskPlan(candidate, adjustedOptions);
       const blockers = portfolioEntryBlockers({
         positions: state.positions,
         candidate,
@@ -449,6 +485,7 @@ async function reviewCandidatesWithAi(candidates) {
 }
 
 function updateLayeredConfirmations(candidates, scanCount, nowIso) {
+  const effectiveOpts = getEffectiveOptions();
   const scalpCandidates = (candidates || []).filter(hasScalpEntry);
   const formalCandidates = (candidates || []).filter((candidate) => !hasScalpEntry(candidate));
   const common = {
@@ -463,7 +500,7 @@ function updateLayeredConfirmations(candidates, scanCount, nowIso) {
   });
   const formal = updateSignalConfirmations(scalp.confirmations, formalCandidates, {
     ...common,
-    requiredScans: options.confirmationScans
+    requiredScans: effectiveOpts.confirmationScans
   });
   return {
     confirmations: formal.confirmations,
@@ -475,9 +512,9 @@ function updateLayeredConfirmations(candidates, scanCount, nowIso) {
       evaluated: scalp.diagnostics.evaluated + formal.diagnostics.evaluated,
       ready: scalp.diagnostics.ready + formal.diagnostics.ready,
       pending: scalp.diagnostics.pending + formal.diagnostics.pending,
-      requiredScans: options.confirmationScans,
+      requiredScans: effectiveOpts.confirmationScans,
       scalpRequiredScans: options.scalpConfirmationScans,
-      formalRequiredScans: options.confirmationScans,
+      formalRequiredScans: effectiveOpts.confirmationScans,
       scalpEvaluated: scalp.diagnostics.evaluated,
       scalpReady: scalp.diagnostics.ready,
       scalpPending: scalp.diagnostics.pending,
@@ -640,14 +677,22 @@ async function buildFormalCandidates() {
 
   const candidates = await mapWithConcurrency(selected, options.requestConcurrency, async (market) => {
     try {
-      const [microstructure, candlesByInterval] = await Promise.all([
+      const [microstructure, candlesByInterval, derivatives] = await Promise.all([
         client.getMarketMicrostructure("spot", market.symbol, {
           depthLimit: config.direction.depthLimit,
           aggTradeLimit: config.direction.aggTradeLimit
         }),
-        fetchCandlesByInterval(market.symbol, timeframePlan.fetchIntervals)
+        fetchCandlesByInterval(market.symbol, timeframePlan.fetchIntervals),
+        client.getFuturesDerivatives(market.symbol, {
+          period: derivativesPeriodForInterval(timeframePlan.executionInterval)
+        })
       ]);
-      const enriched = enrichMarketWithDirection({ market, microstructure, regime });
+      const fused = enrichMarketWithFusion({
+        market,
+        catalog: { spot: spotUniverse, futures: [] },
+        derivatives
+      });
+      const enriched = enrichMarketWithDirection({ market: fused, microstructure, regime });
       const snapshotsByInterval = buildSnapshotsByInterval(enriched, candlesByInterval);
       const executionSnapshot = snapshotsByInterval[timeframePlan.executionInterval];
       const sourceSnapshot = snapshotsByInterval[timeframePlan.sourceSignalInterval] || executionSnapshot;
@@ -805,6 +850,27 @@ function buildTimeframeAlignment(side, snapshot, timeframeSnapshots = []) {
   const hasHigherSupport = supporting.some((item) => item.interval === "1h" || item.interval === "4h" || item.interval === "1d");
   const hasSourceSupport = supporting.some((item) => item.interval === options.sourceSignalInterval);
 
+  // Phase 3.2: 多时间框架分歧评分
+  // 短期 MACD 与高周期 MACD 方向不一致时扣分
+  let divergenceScore = 0;
+  const shortTerm = timeframeSnapshots.find((s) => s.symbol === snapshot.symbol && s.interval === snapshot.interval);
+  const longTerm = timeframeSnapshots.find((s) => s.symbol === snapshot.symbol && (s.interval === "1d" || s.interval === "12h"));
+  if (shortTerm?.indicators && longTerm?.indicators) {
+    const shortMacd = Number(shortTerm.indicators.macdHistogram || 0);
+    const longMacd = Number(longTerm.indicators.macdHistogram || 0);
+    if (shortMacd > 0 && longMacd < 0) {
+      divergenceScore = side === "long" ? -8 : 5; // 短期反弹受阻于长期下行
+    } else if (shortMacd < 0 && longMacd > 0) {
+      divergenceScore = side === "short" ? -8 : 5; // 短期回调可能企稳于长期上行
+    }
+    // RSI 方向不一致
+    const shortRsi = Number(shortTerm.indicators.rsi || 50);
+    const longRsi = Number(longTerm.indicators.rsi || 50);
+    if (Math.abs(shortRsi - longRsi) > 20) {
+      divergenceScore -= 3; // 大分歧扣分
+    }
+  }
+
   return {
     currentInterval: snapshot.interval,
     checkedIntervals: related.map((item) => item.interval),
@@ -814,6 +880,7 @@ function buildTimeframeAlignment(side, snapshot, timeframeSnapshots = []) {
     hardOpposing,
     hasHigherSupport,
     hasSourceSupport,
+    divergenceScore,
     confirmed: hardOpposing.length === 0 && (hasHigherSupport || hasSourceSupport)
   };
 }
@@ -961,7 +1028,7 @@ function buildScalpDecisionProfile(candidate) {
     sourceOrMomentum: sourceOk || Boolean(momentum.qualified) || sideConsensus.strong || noSourceMicrostructure,
     freshness: !noSourceExhaustion.exhausted,
     chase: chaseOk,
-    spread: Number(candidate.spreadPercent || 0) <= options.maxFormalSpreadPercent,
+    spread: Number(candidate.spreadPercent || 0) <= effectiveFormalSpreadLimit(),
     netTarget: Number(candidate.netTargetPercent || 0) >= options.scalpMinNetTargetPercent,
     rewardRisk: Number(candidate.rewardRisk || 0) >= options.scalpMinRewardRisk,
     volatility: Number(candidate.atrPercent || 0) <= options.maxAtrPercent
@@ -989,7 +1056,7 @@ function hasNoSourceMicrostructureScalp(candidate, alert = candidate?.scalpAlert
   if (!alert.triggered) return false;
   if (candidate.timeframeAlignment?.hardOpposing?.length) return false;
   if ((alert.riskFlags || []).length) return false;
-  if (Number(candidate.spreadPercent || 0) > options.maxFormalSpreadPercent) return false;
+  if (Number(candidate.spreadPercent || 0) > effectiveFormalSpreadLimit()) return false;
   if (Number(candidate.atrPercent || 0) > options.maxAtrPercent) return false;
   if (noSourceScalpExhaustion(candidate, alert).exhausted) return false;
 
@@ -1058,7 +1125,7 @@ function directionalVolumeRatio(candidate) {
 function scalpAlertRiskFlags(candidate) {
   const flags = [];
   if (candidate.timeframeAlignment?.hardOpposing?.length) flags.push("higher_timeframe_conflict");
-  if (Number(candidate.spreadPercent || 0) > options.maxFormalSpreadPercent) flags.push("wide_spread");
+  if (Number(candidate.spreadPercent || 0) > effectiveFormalSpreadLimit()) flags.push("wide_spread");
   if (Number(candidate.atrPercent || 0) > options.maxAtrPercent) flags.push("high_volatility");
   if (candidate.side === "long" && Number(candidate.priceChangePercent24h || 0) > options.momentumMaxLongChase24hPercent) flags.push("long_chase24h");
   if (candidate.side === "short" && Number(candidate.priceChangePercent24h || 0) < -options.momentumMaxShortChase24hPercent) flags.push("short_chase24h");
@@ -1238,16 +1305,20 @@ function buildFormalCandidatesForSnapshot(snapshot, microstructure, timeframeSna
   const directSignalSnapshot = sourceSnapshot || snapshot;
   const rawSourceSignals = generateSignalsFromSnapshot(directSignalSnapshot);
   const reviewedSourceSignals = reviewSignalsForQuality(rawSourceSignals, usableSnapshots, 8);
-  return ["long", "short"].map((side) => {
+  const candidates = ["long", "short"].map((side) => {
     const sourceSignal = selectSourceSignalForSide(reviewedSourceSignals, side);
     return buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal, usableSnapshots);
   });
+  const fundingRateValue = snapshot.fundingRate ?? snapshot.derivatives?.fundingRate;
+  const fundingRate = fundingRateValue == null ? NaN : Number(fundingRateValue);
+  if (Number.isFinite(fundingRate)) state.previousFundingRates[snapshot.symbol] = fundingRate;
+  return candidates;
 }
 
 function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal = null, timeframeSnapshots = [snapshot]) {
   const edge = Number(snapshot.directionAnalysis?.edgeScore || 0);
   const volume = Number(snapshot.indicators.volumeRatio || 0);
-  const selected = scoreCandidateSide(snapshot, edge, side, sourceSignal);
+  const selected = scoreCandidateSide(snapshot, edge, side, sourceSignal, microstructure);
   const edgeAligned = side === "long" ? edge : -edge;
   const timeframeAlignment = buildTimeframeAlignment(side, snapshot, timeframeSnapshots);
   const momentumProfile = buildMomentumProfile({
@@ -1260,7 +1331,9 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
   });
 
   const orderBook = microstructure?.orderBook || {};
+  // 纸面成交必须使用当前可执行盘口价；VWAP 仅作为诊断锚点，不能伪造成已成交价格。
   const entryPrice = executablePrice(orderBook, side, "open") || snapshot.price;
+  const vwapAnchorPrice = side === "long" ? snapshot.vwap?.upperBand : snapshot.vwap?.lowerBand;
   const atrPercent = snapshot.indicators.atr && entryPrice
     ? (snapshot.indicators.atr / entryPrice) * 100
     : options.minStopPercent;
@@ -1269,8 +1342,19 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
     options.minTargetPercent,
     options.maxTargetPercent
   );
-  const stopPercent = clamp(
-    Math.max(options.minStopPercent, atrPercent * options.stopAtrFraction),
+  // Phase 1.5G: 止损位与支撑阻力联动
+  // 做多时止损参考支撑位，做空时止损参考阻力位，避免被正常波动扫出
+  const srData = snapshot.supportResistance;
+  const atrStop = atrPercent * options.stopAtrFraction;
+  const structuralStop = side === "long"
+    ? (srData?.support
+        ? ((entryPrice - srData.support) / entryPrice) * 100
+        : atrStop)
+    : (srData?.resistance
+        ? ((srData.resistance - entryPrice) / entryPrice) * 100
+        : atrStop);
+  let stopPercent = clamp(
+    Math.min(atrStop * 1.2, Math.max(structuralStop * 0.8, atrStop)),
     options.minStopPercent,
     options.maxStopPercent
   );
@@ -1304,6 +1388,7 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
     timeframeAlignment,
     momentumProfile,
     rsi: snapshot.indicators.rsi,
+    adx: snapshot.indicators.adx,
     macdHistogram: snapshot.indicators.macdHistogram,
     candleChangePercent: snapshot.candleChangePercent,
     liveCandle: snapshot.liveCandle,
@@ -1322,7 +1407,10 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
     },
     priceChangePercent24h: snapshot.priceChangePercent24h,
     sourceSignal: compactSourceSignal(sourceSignal),
-    reasons: selected.reasons
+    reasons: selected.reasons,
+    marketRegime: snapshot.marketRegime || null,
+    supportResistance: snapshot.supportResistance || null,
+    vwapAnchorPrice: Number.isFinite(Number(vwapAnchorPrice)) ? round(Number(vwapAnchorPrice), 10) : null
   };
   const withScalpProfiles = {
     ...candidate,
@@ -1341,8 +1429,13 @@ function buildBaseFormalCandidate(snapshot, microstructure, side, sourceSignal =
   };
   const plannedCandidate = applyTradeStylePlan(candidateWithDecision, tradeStyle);
 
+  // Phase 3.2: 应用多时间框架分歧评分
+  const divergenceAdj = Number(timeframeAlignment.divergenceScore || 0);
+  const adjustedScore = clamp(Math.round(plannedCandidate.score + divergenceAdj), 0, 100);
+
   return {
     ...plannedCandidate,
+    score: adjustedScore,
     tradeStyle,
     actionPlan: buildActionPlan(side, tradeStyle),
     strategyGroup: `${tradeStyle}:${side}:${options.signalInterval}`,
@@ -1408,6 +1501,10 @@ function hasFormalEntryQuality(candidate) {
   // v2 优化：即使 sourceSignal 未通过质量审查，只要自身技术确认足够强也可以通过
   // 原有逻辑：必须 actionable sourceSignal → 导致 100% 拦截（27/27 sourceSignal 都是 filtered）
   if (hasStrongSideTechnicalConsensus(candidate)) return true;
+  // Phase 1.2E: 做空专用路径 — risk_off 市场中 sourceSignal filtered 但技术面确认 + 趋势明确 → 可放宽
+  // 修复：做空永远被 source_quality 拦截的结构性缺陷
+  if (!hasActionableSourceSignal(candidate)
+    && allowsRiskOffShortEntry(candidate, { executionMinEdge: options.executionMinEdge })) return true;
   // v2 新增：sourceSignal 虽然 filtered 但评分 ≥ 62（原70，Phase 1下调）+ 边缘分达标 → 可放宽
   const sourceOk = candidate?.sourceSignal?.score >= options.filteredSourceMinScore
     && candidate?.sourceSignal?.qualityStatus === "filtered"
@@ -1415,6 +1512,37 @@ function hasFormalEntryQuality(candidate) {
     && candidate?.technicalAligned;
   if (sourceOk) return true;
   return false;
+}
+
+// Phase 1.3F: 市场环境动态阈值调整
+// risk_on: 做多阈值 × 0.85, 做空阈值 × 1.20
+// risk_off: 做多阈值 × 1.25, 做空阈值 × 0.80
+function adjustThresholdsByRegime(profile, candidate) {
+  const regimeBias = candidate?.marketRegime?.bias;
+  if (!regimeBias) return profile;
+  const adjusted = { ...profile };
+  if (regimeBias === "risk_off") {
+    if (candidate.side === "short") {
+      // risk_off 市场做空：降低阈值 × 0.80
+      adjusted.minEdge = Math.max(8, Math.round(profile.minEdge * 0.80));
+      adjusted.minScore = Math.max(48, Math.round(profile.minScore * 0.80));
+    } else {
+      // risk_off 市场做多：提高阈值 × 1.25（逆势保护）
+      adjusted.minEdge = Math.round(profile.minEdge * 1.25);
+      adjusted.minScore = Math.round(profile.minScore * 1.25);
+    }
+  } else if (regimeBias === "risk_on") {
+    if (candidate.side === "long") {
+      // risk_on 市场做多：降低阈值 × 0.85
+      adjusted.minEdge = Math.max(8, Math.round(profile.minEdge * 0.85));
+      adjusted.minScore = Math.max(48, Math.round(profile.minScore * 0.85));
+    } else {
+      // risk_on 市场做空：提高阈值 × 1.20（逆势保护）
+      adjusted.minEdge = Math.round(profile.minEdge * 1.20);
+      adjusted.minScore = Math.round(profile.minScore * 1.20);
+    }
+  }
+  return adjusted;
 }
 
 function evaluateCandidateWithProfile(candidate, profile = resolveRiskProfile()) {
@@ -1426,12 +1554,14 @@ function evaluateCandidateWithProfile(candidate, profile = resolveRiskProfile())
         minRewardRisk: options.scalpMinRewardRisk
       }
     : resolved;
+  // Phase 1.3F: 应用市场环境动态阈值
+  const dynamicProfile = adjustThresholdsByRegime(safetyProfile, candidate);
   const filterFailures = [];
   if (candidate.edgeAligned <= -options.edgeContradiction) filterFailures.push("edge_contradiction");
-  else if (candidate.edgeAligned < resolved.minEdge) filterFailures.push("edge");
-  if (candidate.score < resolved.minScore) filterFailures.push("score");
+  else if (candidate.edgeAligned < dynamicProfile.minEdge) filterFailures.push("edge");
+  if (candidate.score < dynamicProfile.minScore) filterFailures.push("score");
   if (!candidate.technicalAligned) filterFailures.push("technical");
-  if (candidate.volumeRatio < resolved.minVolumeRatio) filterFailures.push("volume");
+  if (candidate.volumeRatio < dynamicProfile.minVolumeRatio) filterFailures.push("volume");
   if (hasFilteredSourceSignal(candidate)) filterFailures.push("source_quality");
   if (!hasFormalEntryQuality(candidate)) filterFailures.push("entry_quality");
   if (candidate.timeframeAlignment?.hardOpposing?.length) filterFailures.push("timeframe_conflict");
@@ -1444,7 +1574,7 @@ function evaluateCandidateWithProfile(candidate, profile = resolveRiskProfile())
     maxLongChase24hPercent: safetyProfile.maxLongChase24hPercent,
     maxShortChase24hPercent: safetyProfile.maxShortChase24hPercent,
     maxAtrPercent: safetyProfile.maxAtrPercent,
-    maxSpreadPercent: safetyProfile.maxFormalSpreadPercent,
+    maxSpreadPercent: effectiveFormalSpreadLimit(safetyProfile.maxFormalSpreadPercent),
     minNetTargetPercent: safetyProfile.minNetTargetPercent,
     minRewardRisk: safetyProfile.minRewardRisk
   }));
@@ -1490,12 +1620,15 @@ function tradeCandidateBlockers(candidate) {
   if (candidate.accepted) return uniqueValues(blockers);
 
   const softFailures = candidate.softFailures || [];
+  const effectiveMaxSoftFailures = getEffectiveOptions().executionMaxSoftFailures ?? options.executionMaxSoftFailures;
   const maxSoftFailures = momentumEntry
-    ? Math.max(options.executionMaxSoftFailures, options.momentumMaxSoftFailures)
-    : options.executionMaxSoftFailures;
+    ? Math.max(effectiveMaxSoftFailures, options.momentumMaxSoftFailures)
+    : effectiveMaxSoftFailures;
   if (softFailures.length > maxSoftFailures) blockers.push("too_many_soft_failures");
   if (candidate.score < options.executionMinScore) blockers.push("execution_score");
   if (candidate.edgeAligned < options.executionMinEdge) blockers.push("execution_edge");
+  const candidateAdx = candidate.adx == null ? null : Number(candidate.adx);
+  if (!momentumEntry && Number.isFinite(candidateAdx) && candidateAdx < 18) blockers.push("low_trend_strength");
   if (softFailures.includes("edge") && !hasActionableSourceSignal(candidate)) {
     blockers.push("weak_edge_without_actionable_source");
   }
@@ -1584,7 +1717,7 @@ function candidateMargins(candidate, profile) {
     rewardRisk: Number.isFinite(candidate.rewardRisk) ? round(candidate.rewardRisk - profile.minRewardRisk, 4) : null,
     chase24h: Number.isFinite(chaseMargin) ? round(chaseMargin, 4) : null,
     volatility: round(profile.maxAtrPercent - candidate.atrPercent, 4),
-    spread: round(profile.maxFormalSpreadPercent - candidate.spreadPercent, 4)
+    spread: round(effectiveFormalSpreadLimit(profile.maxFormalSpreadPercent) - candidate.spreadPercent, 4)
   };
 }
 
@@ -1645,10 +1778,13 @@ function updateAggregateDiagnostics(target, candidates = []) {
     .slice(0, 20);
 }
 
-function scoreCandidateSide(snapshot, edge, side, sourceSignal = null) {
+function scoreCandidateSide(snapshot, edge, side, sourceSignal = null, microstructure = null) {
   const rsi = Number(snapshot.indicators.rsi || 50);
   const histogram = Number(snapshot.indicators.macdHistogram || 0);
   const volume = Number(snapshot.indicators.volumeRatio || 0);
+  const adxScore = Number(snapshot.indicators.adx || 0);
+  const plusDI = Number(snapshot.indicators.adxPlusDI || 0);
+  const minusDI = Number(snapshot.indicators.adxMinusDI || 0);
   const edgeAligned = side === "long" ? edge : -edge;
   const reasons = [];
   // v2 优化：降低 edge 系数 0.8→0.5，提高基础分 42→48
@@ -1735,6 +1871,62 @@ function scoreCandidateSide(snapshot, edge, side, sourceSignal = null) {
   }
   if (Number(snapshot.spreadPercent || 0) > 0.15) score -= 10;
 
+  // Phase 2.1: ADX 趋势强度评分
+  if (Number.isFinite(adxScore) && adxScore > 0) {
+    const directionalStrength = side === "long" ? plusDI - minusDI : minusDI - plusDI;
+    if (adxScore >= 25 && directionalStrength > 0) {
+      score += 5;
+      reasons.push(`ADX ${adxScore} 方向一致的强趋势加分`);
+    } else if (adxScore >= 20 && directionalStrength > 0) {
+      score += 2;
+      reasons.push(`ADX ${adxScore} 方向一致`);
+    } else if (adxScore >= 25 && directionalStrength < 0) {
+      score -= 5;
+      reasons.push(`ADX ${adxScore} 强趋势方向相反`);
+    }
+  }
+
+  // Phase 2.2: CVD 累积成交量差背离检测
+  if (microstructure?.aggressiveTrades) {
+    const cvdResult = computeCVD(microstructure.aggressiveTrades);
+    if (cvdResult.divergence === "bullish_reversal" && side === "long") {
+      score += 8;
+      reasons.push("CVD 看跌转看涨背离");
+    } else if (cvdResult.divergence === "bearish_reversal" && side === "short") {
+      score += 8;
+      reasons.push("CVD 看涨转看跌背离");
+    } else if (cvdResult.divergence === "bullish" && side === "long") {
+      score += 3;
+      reasons.push("CVD 偏多");
+    } else if (cvdResult.divergence === "bearish" && side === "short") {
+      score += 3;
+      reasons.push("CVD 偏空");
+    }
+  }
+
+  // Phase 2.3: OI 背离检测
+  const oiChange = alignedOpenInterestChange(snapshot.derivatives, snapshot.interval);
+  if (oiChange != null) {
+    const oiDiv = computeOIDivergence(snapshot.candleChangePercent, oiChange);
+    if (oiDiv.score !== 0) {
+      const aligned = side === "long" ? oiDiv.score : -oiDiv.score;
+      score += clamp(Math.round(aligned * 0.6), -5, 5);
+      if (oiDiv.label) reasons.push(`OI ${oiDiv.label}`);
+    }
+  }
+
+  // Phase 2.4: 资金费率信号
+  const fundingRateValue = snapshot.fundingRate ?? snapshot.derivatives?.fundingRate;
+  const fundingRate = fundingRateValue == null ? NaN : Number(fundingRateValue);
+  const prevFundingRate = state.previousFundingRates[snapshot.symbol] ?? null;
+  if (Number.isFinite(fundingRate)) {
+    const fundingSignal = fundingRateSignal(fundingRate, side, prevFundingRate);
+    if (fundingSignal.score !== 0) {
+      score += fundingSignal.score;
+      if (fundingSignal.label) reasons.push(fundingSignal.label);
+    }
+  }
+
   return {
     score: clamp(Math.round(score), 0, 100),
     technicalAligned,
@@ -1780,26 +1972,130 @@ async function pollOpenPositions() {
 
 async function checkPosition(position) {
   const book = await client.getOrderBookDepth("spot", position.symbol, 5);
-  const exitPrice = executablePrice(book, position.side, "close") || position.entryPrice;
+  const exitPrice = executablePrice(book, position.side, "close");
+  if (exitPrice == null) throw new Error(`No executable close price for ${position.symbol}`);
   const gross = grossReturnPercent(position.side, position.entryPrice, exitPrice);
   const next = updatePathStats(position, exitPrice, gross, book);
+
+  // 价格已经触及硬止盈/止损时必须优先全平，不能被健康减仓逻辑截断。
+  const hardExit = hardExitOutcome(position, exitPrice);
+  if (hardExit) return closePosition(next, hardExit, exitPrice);
 
   if (isPositionExpired(position)) {
     return closePosition(next, "scalp_timeout", exitPrice);
   }
 
-  if (position.side === "long") {
-    if (exitPrice >= position.takeProfit) return closePosition(next, "tp", exitPrice);
-    if (exitPrice <= position.stopLoss) return closePosition(next, "stop", exitPrice);
-  } else {
-    if (exitPrice <= position.takeProfit) return closePosition(next, "tp", exitPrice);
-    if (exitPrice >= position.stopLoss) return closePosition(next, "stop", exitPrice);
+  // Phase 3.4: 动态止盈追踪 (Trailing Stop)
+  // 当盈利达到 targetPercent 的 60% 时，启用 trailing stop
+  const trailingThreshold = (position.targetPercent || 3) * 0.6;
+  let adjustedStopLoss = position.stopLoss;
+  if (gross >= trailingThreshold && gross > 0) {
+    const trailPercent = (position.stopPercent || 2) * 0.5; // 追踪止损 = 原止损的 50%
+    const trailStop = position.side === "long"
+      ? exitPrice * (1 - trailPercent / 100)
+      : exitPrice * (1 + trailPercent / 100);
+    // 更新止损位为 trailing stop（只能朝有利方向移动）
+    if (position.side === "long") {
+      adjustedStopLoss = Math.max(position.stopLoss, trailStop);
+    } else {
+      adjustedStopLoss = Math.min(position.stopLoss, trailStop);
+    }
+    next.trailingStopActive = true;
+  }
+  next.stopLoss = adjustedStopLoss;
+
+  // Phase 3.3: 持仓健康评估
+  const health = assessPositionHealth(next, exitPrice);
+  next.positionHealth = health;
+
+  // 信号崩塌：立即平仓
+  if (health.status === "signal_collapsed") {
+    return closePosition(next, "signal_collapse", exitPrice);
+  }
+
+  // 信号衰减（signal_weakening）：减仓 50%，保留另一半
+  if (health.status === "signal_weakening" && !position.healthReduced) {
+    const reduced = reducePositionHalf(next, exitPrice);
+    return reduced;
+  }
+
+  // 信号消退（signal_fading）：移至保本止损（入场价）
+  if (health.status === "signal_fading" && !position.breakevenStopApplied) {
+    next.stopLoss = position.entryPrice;
+    next.breakevenStopApplied = true;
   }
 
   return {
     ...next,
     unrealizedGrossReturnPercent: round(gross, 4)
   };
+}
+
+// Phase 3.3: 持仓健康评估函数
+function assessPositionHealth(position, currentExitPrice) {
+  const gross = grossReturnPercent(position.side, position.entryPrice, currentExitPrice);
+  const maxUnrealized = Number(position.bestGrossReturnPercent || 0);
+  const drawdown = maxUnrealized > 0 ? maxUnrealized - gross : 0;
+  const holdMinutes = position.openedAt
+    ? (Date.now() - Date.parse(position.openedAt)) / 60000
+    : 0;
+  const targetPercent = position.targetPercent || 3;
+  const progressToTarget = targetPercent > 0 ? gross / targetPercent : 0;
+
+  // 信号崩塌：盈利回撤超过最大收益的 70%（decayRatio < 0.5）
+  if (maxUnrealized > 1 && drawdown / maxUnrealized > 0.7) {
+    return { status: "signal_collapsed", reason: `盈利回撤 ${round(drawdown, 2)}% 超过峰值的 70%`, action: "close" };
+  }
+  // 信号衰减（signal_weakening）：盈利回撤 40-70%（decayRatio < 0.7）→ 减仓 50%
+  if (maxUnrealized > 0.5 && drawdown / maxUnrealized > 0.4) {
+    return { status: "signal_weakening", reason: `盈利回撤 ${round(drawdown, 2)}%（峰值 ${round(maxUnrealized, 2)}%）达 40%+`, action: "reduce_50" };
+  }
+  // 信号消退（signal_fading）：持仓时间超过上限 80% 但盈利未达目标 30% → 移至保本止损
+  const maxHold = normalizeMaxHoldMinutes(position.maxHoldMinutes);
+  if (maxHold && holdMinutes > maxHold * 0.8 && progressToTarget < 0.3) {
+    return { status: "signal_fading", reason: `持仓时间 ${round(holdMinutes, 0)}m 达上限 80% 但盈利仅 ${round(progressToTarget * 100, 0)}%`, action: "breakeven_stop" };
+  }
+  // 信号健康
+  return { status: "healthy", reason: `盈利 ${round(gross, 2)}% 进度 ${round(progressToTarget * 100, 0)}%`, action: null };
+}
+
+// Phase 3.3: 减仓 50% — 将一半头寸平仓，保留剩余部分
+function reducePositionHalf(position, exitPrice) {
+  const halfSizePercent = Number(position.positionSizePercentOfEquity || 0) * 0.5;
+  const gross = grossReturnPercent(position.side, position.entryPrice, exitPrice);
+  const cost = estimateFormalRoundTripCost();
+  const estimatedNet = gross - cost.totalCostPercent;
+  const partialClose = {
+    ...position,
+    id: `${position.id}:partial`,
+    status: "closed",
+    outcome: "health_reduce",
+    closedAt: new Date().toISOString(),
+    exitPrice: round(exitPrice, 10),
+    secondsHeld: Math.round((Date.now() - Date.parse(position.openedAt)) / 1000),
+    grossReturnPercent: round(gross, 4),
+    feePercent: cost.feePercent,
+    slippagePercent: cost.slippagePercent,
+    estimatedNetReturnPercent: round(estimatedNet, 4),
+    netReturnPercent: round(estimatedNet, 4),
+    positionSizePercentOfEquity: halfSizePercent,
+    realizedAccountReturnPercent: round(estimatedNet * halfSizePercent / 100, 4),
+    netWin: estimatedNet > 0,
+    isPartialClose: true,
+    parentTradeId: position.id
+  };
+  replaceTrade(partialClose);
+  console.log(`[formal-monitor][health] REDUCE_50% ${position.symbol} gross=${gross.toFixed(2)}% net=${estimatedNet.toFixed(2)}%`);
+  const remaining = {
+    ...position,
+    healthReduced: true,
+    positionSizePercentOfEquity: halfSizePercent,
+    accountRiskPercent: round(Number(position.accountRiskPercent || 0) * 0.5, 4),
+    targetAccountRiskPercent: round(Number(position.targetAccountRiskPercent || 0) * 0.5, 4)
+  };
+  replaceTrade(remaining);
+  updatePortfolioRiskGuard();
+  return remaining;
 }
 
 function isPositionExpired(position) {
@@ -1814,15 +2110,23 @@ function normalizeMaxHoldMinutes(value) {
 }
 
 async function closeAllOpenPositions(outcome) {
-  const closed = await mapWithConcurrency(state.positions, options.requestConcurrency, async (position) => {
-    const book = await client.getOrderBookDepth("spot", position.symbol, 5);
-    const exitPrice = executablePrice(book, position.side, "close") || position.entryPrice;
-    const gross = grossReturnPercent(position.side, position.entryPrice, exitPrice);
-    return closePosition(updatePathStats(position, exitPrice, gross, book), outcome, exitPrice);
+  const results = await mapWithConcurrency(state.positions, options.requestConcurrency, async (position) => {
+    try {
+      const book = await client.getOrderBookDepth("spot", position.symbol, 5);
+      const exitPrice = executablePrice(book, position.side, "close");
+      if (exitPrice == null) throw new Error(`No executable close price for ${position.symbol}`);
+      const gross = grossReturnPercent(position.side, position.entryPrice, exitPrice);
+      return { ok: true, trade: closePosition(updatePathStats(position, exitPrice, gross, book), outcome, exitPrice) };
+    } catch (error) {
+      recordError("position_close", error, { symbol: position.symbol });
+      return { ok: false, position };
+    }
   });
-  state.positions = [];
+  const closed = results.filter((result) => result.ok).map((result) => result.trade);
+  state.positions = results.filter((result) => !result.ok).map((result) => result.position);
   for (const item of closed) replaceTrade(item);
   state.summary = summarizeTrades(state.trades);
+  return { closedCount: closed.length, failedCount: state.positions.length };
 }
 
 function updatePathStats(position, price, gross, book) {
@@ -1832,11 +2136,13 @@ function updatePathStats(position, price, gross, book) {
   const worstPrice = position.side === "long"
     ? Math.min(position.worstPrice, price)
     : Math.max(position.worstPrice, price);
+  const bestGrossReturnPercent = Math.max(Number(position.bestGrossReturnPercent || 0), gross);
 
   return {
     ...position,
     bestPrice: round(bestPrice, 10),
     worstPrice: round(worstPrice, 10),
+    bestGrossReturnPercent: round(bestGrossReturnPercent, 4),
     polls: [
       ...position.polls,
       {
@@ -1870,6 +2176,7 @@ function closePosition(position, outcome, exitPrice) {
     netWin: estimatedNet > 0
   };
   replaceTrade(closed);
+  applyFeedbackFromClosedTrades();
   // --- 风险护栏：止损触发后更新连续止损和最大回撤状态 ---
   if (closed.outcome === "stop") {
     updateConsecutiveStopPause();
@@ -1887,7 +2194,8 @@ function replaceTrade(trade) {
 }
 
 function summarizeTrades(trades) {
-  const closed = trades.filter((trade) => trade.status === "closed");
+  const closedLegs = trades.filter((trade) => trade.status === "closed");
+  const closed = combineTradeRealizations(closedLegs);
   const netWins = closed.filter((trade) => trade.netWin).length;
   const grossWins = closed.filter((trade) => Number(trade.grossReturnPercent || 0) > 0).length;
   const totalNet = closed.reduce((sum, trade) => sum + Number(trade.estimatedNetReturnPercent || 0), 0);
@@ -1896,12 +2204,13 @@ function summarizeTrades(trades) {
   const avgLossAbs = Math.abs(mean(closed.filter((trade) => Number(trade.estimatedNetReturnPercent) < 0).map((trade) => Number(trade.estimatedNetReturnPercent))) || 0);
   const performance = summarizePerformance(closed, (trade) => Number(trade.estimatedNetReturnPercent ?? 0));
   const accountPerformance = summarizePerformance(closed, realizedAccountReturnPercent);
-  const portfolioRisk = calculatePortfolioRiskMetrics(closed);
+  const portfolioRisk = calculatePortfolioRiskMetrics(closedLegs, { timeZone: options.timeZone });
 
   return {
-    trades: trades.length,
+    trades: primaryTradeCount(trades),
     open: trades.filter((trade) => trade.status === "open").length,
     closed: closed.length,
+    partialCloses: closedLegs.filter((trade) => trade.isPartialClose).length,
     tp: closed.filter((trade) => trade.outcome === "tp").length,
     stop: closed.filter((trade) => trade.outcome === "stop").length,
     timeout: closed.filter((trade) => trade.outcome === "timeout" || trade.outcome === "scalp_timeout").length,
@@ -1919,7 +2228,9 @@ function summarizeTrades(trades) {
     portfolioRisk,
     validation: validationStatusForTrades(closed, performance, accountPerformance),
     bySide: summarizeTradeGroups(closed, (trade) => trade.side),
-    byStrategyGroup: summarizeTradeGroups(closed, (trade) => trade.strategyGroup || `${trade.side || "unknown"}:${options.signalInterval}`)
+    byStrategyGroup: summarizeTradeGroups(closed, (trade) => trade.strategyGroup || `${trade.side || "unknown"}:${options.signalInterval}`),
+    // Phase 3.6: 交易后反馈回路 + 自动调阈值
+    feedbackLoop: buildFeedbackLoop(closed)
   };
 }
 
@@ -1951,6 +2262,39 @@ function summarizeTradeGroups(trades, keyFn) {
       }
     ];
   }));
+}
+
+// Phase 3.5: 时段效应自适应参数
+function getHourBias(nowMs = Date.now()) {
+  return hourBiasAt(nowMs, options.timeZone);
+}
+
+function getHourAdjustedOptions() {
+  return hourAdjustedOptions(options, getHourBias());
+}
+
+// 合并基础 options 与时段调整后的有效参数
+function getEffectiveOptions() {
+  const adjusted = state.hourAdjustedOptions || {};
+  return { ...options, ...adjusted };
+}
+
+function effectiveFormalSpreadLimit(profileLimit = options.maxFormalSpreadPercent) {
+  return Math.min(Number(profileLimit), Number(getEffectiveOptions().maxFormalSpreadPercent));
+}
+
+function applyFeedbackFromClosedTrades() {
+  const feedback = buildFeedbackLoop(combineTradeRealizations(
+    state.trades.filter((trade) => trade.status === "closed")
+  ));
+  const result = applyFeedbackRecommendationsOnce(options, feedback, state.feedbackAdjustments);
+  if (!result.applied) return feedback;
+  Object.assign(options, result.options);
+  state.feedbackAdjustments = result.adjustment;
+  for (const recommendation of result.adjustment.recommendations) {
+    console.log(`[formal-monitor][feedback] ${recommendation.action} ${recommendation.filter}: ${recommendation.suggestion}`);
+  }
+  return feedback;
 }
 
 function validationStatusForTrades(closed, performance, accountPerformance = performance) {
@@ -2052,7 +2396,11 @@ function isCoolingDown(candidate) {
 }
 
 function closedTrades() {
-  return state.trades.filter((trade) => trade.status === "closed");
+  return state.trades.filter((trade) => trade.status === "closed" && !trade.isPartialClose);
+}
+
+function primaryTradeCount(trades = state.trades) {
+  return trades.filter((trade) => !trade.isPartialClose).length;
 }
 
 function queueFormalMonitorFeishuNotification(type, trade) {
@@ -2183,10 +2531,10 @@ function isRiskGuardPaused() {
 
 function updateConsecutiveStopPause() {
   const recentClosed = state.trades
-    .filter((t) => t.status === "closed")
+    .filter((t) => t.status === "closed" && !t.isPartialClose)
     .sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt))
-    .slice(0, CONSECUTIVE_STOP_TRIGGER);
-  if (recentClosed.length < CONSECUTIVE_STOP_TRIGGER) return;
+    .slice(0, consecutiveStopTrigger);
+  if (recentClosed.length < consecutiveStopTrigger) return;
   const allStopLoss = recentClosed.every((t) => t.outcome === "stop");
   if (allStopLoss) {
     const pauseUntil = new Date(Date.now() + CONSECUTIVE_STOP_PAUSE_MS).toISOString();
@@ -2197,13 +2545,13 @@ function updateConsecutiveStopPause() {
       pauseUntil,
       recentSymbols: recentClosed.map((t) => t.symbol)
     });
-    console.log(`[formal-monitor][risk-guard] CONSECUTIVE_STOP ${CONSECUTIVE_STOP_TRIGGER}x in a row → pause until ${pauseUntil} symbols=${recentClosed.map((t) => t.symbol).join(",")}`);
+    console.log(`[formal-monitor][risk-guard] CONSECUTIVE_STOP ${consecutiveStopTrigger}x in a row → pause until ${pauseUntil} symbols=${recentClosed.map((t) => t.symbol).join(",")}`);
   }
 }
 
 function updatePortfolioRiskGuard() {
   const now = Date.now();
-  const metrics = calculatePortfolioRiskMetrics(state.trades, { nowMs: now });
+  const metrics = calculatePortfolioRiskMetrics(state.trades, { nowMs: now, timeZone: options.timeZone });
   state.riskGuard.sessionMaxDrawdownPercent = metrics.maxDrawdownPercent;
 
   if (!state.riskGuard.sessionHaltedAt && metrics.maxDrawdownPercent >= options.maxSessionDrawdownPercent) {
@@ -2219,7 +2567,7 @@ function updatePortfolioRiskGuard() {
   }
 
   if (metrics.dailyAccountReturnPercent <= -options.maxDailyLossPercent) {
-    const pauseUntil = nextUtcDayIso(now);
+    const pauseUntil = nextSessionDayIso(now, options.timeZone);
     if (state.riskGuard.dailyLossPauseUntil !== pauseUntil) {
       state.riskGuard.dailyLossPauseUntil = pauseUntil;
       state.riskGuard.pauseEvents.push({
@@ -2285,6 +2633,7 @@ function restoreRuntimeState() {
       return;
     }
     const { options: _savedOptions, ...savedState } = recovered;
+    restoreFeedbackOptions(recovered.feedbackAdjustments?.currentOptions);
     Object.assign(state, savedState, {
       persistenceVersion: 1,
       sessionDate: recovered.sessionDate || initialSessionDate,
@@ -2300,6 +2649,14 @@ function restoreRuntimeState() {
   }
 }
 
+function restoreFeedbackOptions(savedOptions = null) {
+  if (!savedOptions || typeof savedOptions !== "object") return;
+  for (const key of ["minEdge", "minScore", "minVolumeRatio", "maxFormalSpreadPercent"]) {
+    const value = Number(savedOptions[key]);
+    if (Number.isFinite(value)) options[key] = value;
+  }
+}
+
 function rotateSessionIfNeeded() {
   const today = sessionDateKey(new Date(), options.timeZone);
   if (state.sessionDate === today) return;
@@ -2310,11 +2667,8 @@ function rotateSessionIfNeeded() {
   persistState();
 
   const previousSessionDate = state.sessionDate;
-  const carriedPositions = state.positions.map((position) => ({
-    ...position,
-    carriedOver: true,
-    carriedFromSession: previousSessionDate
-  }));
+  const carried = carryOpenTradeState(state.positions, state.trades, previousSessionDate);
+  const carriedPositions = carried.positions;
   state.sessionDate = today;
   state.startedAt = new Date().toISOString();
   state.finishedAt = null;
@@ -2322,7 +2676,7 @@ function rotateSessionIfNeeded() {
   state.status = "running";
   state.scanCount = 0;
   state.errors = [];
-  state.trades = carriedPositions;
+  state.trades = carried.trades;
   state.signalConfirmations = {};
   state.summary = summarizeTrades(state.trades);
   state.riskGuard = {
@@ -2358,11 +2712,6 @@ function estimateFormalRoundTripCost() {
     slippagePercent: round(Math.max(0, slippagePercent), 4),
     totalCostPercent: round(Math.max(0, feePercent) + Math.max(0, slippagePercent), 4)
   };
-}
-
-function executablePrice(book, side, action) {
-  if (side === "long") return action === "open" ? Number(book.bestAsk) : Number(book.bestBid);
-  return action === "open" ? Number(book.bestBid) : Number(book.bestAsk);
 }
 
 function applyMove(price, side, percent) {
