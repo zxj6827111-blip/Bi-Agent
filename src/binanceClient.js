@@ -70,7 +70,16 @@ async function requestJsonWithFallback(baseUrls, path, params = {}, options = {}
     let retryableFailure = false;
     for (const baseUrl of urls) {
       try {
-        return await requestJson(baseUrl, path, params, { ...options, attempt });
+        const value = await requestJson(baseUrl, path, params, { ...options, attempt });
+        return {
+          value,
+          meta: {
+            activeEndpoint: baseUrl,
+            attempt,
+            elapsedMs: Date.now() - startedAt,
+            fallbackErrors: errors
+          }
+        };
       } catch (error) {
         const retryable = Boolean(error.details?.retryable);
         retryableFailure ||= retryable;
@@ -291,25 +300,50 @@ export class BinanceClient {
     health.requestCount += 1;
     health.lastPath = path;
     try {
-      const value = await requestJsonWithFallback(baseUrls, path, params, {
+      const result = await requestJsonWithFallback(baseUrls, path, params, {
         timeoutMs: this.requestTimeoutMs,
         retryCount: this.requestRetryCount,
         retryBaseDelayMs: this.requestRetryBaseDelayMs
       });
+      const fallbackErrors = result.meta.fallbackErrors || [];
+      const fallbackSummary = summarizeRequestErrors(fallbackErrors);
       health.successCount += 1;
       health.lastSuccessAt = new Date().toISOString();
       health.lastDurationMs = Date.now() - startedAt;
-      health.lastError = null;
-      return value;
+      health.status = fallbackErrors.length ? "degraded" : "ok";
+      health.errorKind = fallbackSummary?.kind || null;
+      health.statusCode = fallbackSummary?.statusCode || null;
+      health.activeEndpoint = result.meta.activeEndpoint;
+      health.lastError = fallbackSummary;
+      if (fallbackErrors.length) {
+        health.lastFallbackAt = health.lastSuccessAt;
+        health.lastFallbackErrors = fallbackErrors.slice(-10).map(toRequestErrorSummary);
+      }
+      return result.value;
     } catch (error) {
+      const requestErrors = error.details?.errors || [];
+      const errorSummary = summarizeRequestErrors(requestErrors) || {
+        kind: classifyRequestError(error.details || { message: error.message }),
+        message: error.message,
+        cause: error.details?.cause || null,
+        statusCode: error.details?.status || null
+      };
       health.failureCount += 1;
       health.lastFailureAt = new Date().toISOString();
       health.lastDurationMs = Date.now() - startedAt;
+      health.status = "unavailable";
+      health.errorKind = errorSummary.kind;
+      health.statusCode = errorSummary.statusCode;
+      health.activeEndpoint = null;
+      health.lastFallbackErrors = requestErrors.slice(-10).map(toRequestErrorSummary);
       health.lastError = {
         message: error.message,
         path,
         elapsedMs: error.details?.elapsedMs ?? health.lastDurationMs,
-        attempts: error.details?.errors?.at(-1)?.attempt || 1
+        attempts: requestErrors.at(-1)?.attempt || 1,
+        kind: errorSummary.kind,
+        cause: errorSummary.cause,
+        statusCode: errorSummary.statusCode
       };
       throw error;
     }
@@ -322,6 +356,7 @@ export class BinanceClient {
 
 function createRequestHealth() {
   return {
+    status: "unknown",
     requestCount: 0,
     successCount: 0,
     failureCount: 0,
@@ -329,7 +364,12 @@ function createRequestHealth() {
     lastSuccessAt: null,
     lastFailureAt: null,
     lastDurationMs: null,
-    lastError: null
+    lastError: null,
+    errorKind: null,
+    statusCode: null,
+    activeEndpoint: null,
+    lastFallbackAt: null,
+    lastFallbackErrors: []
   };
 }
 
@@ -338,7 +378,37 @@ function isRetryableStatus(status) {
 }
 
 function isRetryableCause(cause) {
-  return /timeout|timedout|econnreset|econnrefused|enotfound|fetch failed|socket/i.test(String(cause || ""));
+  return /timeout|timedout|econnreset|econnrefused|enotfound|eai_again|fetch failed|socket/i.test(String(cause || ""));
+}
+
+function summarizeRequestErrors(errors = []) {
+  if (!errors.length) return null;
+  const summaries = errors.map(toRequestErrorSummary);
+  return summaries.find((item) => item.kind === "restricted")
+    || summaries.find((item) => item.kind === "dns")
+    || summaries.find((item) => item.kind === "timeout")
+    || summaries.at(-1);
+}
+
+function toRequestErrorSummary(error = {}) {
+  return {
+    kind: classifyRequestError(error),
+    message: error.message || null,
+    cause: error.cause || null,
+    statusCode: error.status || error.statusCode || null,
+    attempt: error.attempt || 1,
+    elapsedMs: error.elapsedMs ?? null
+  };
+}
+
+function classifyRequestError(error = {}) {
+  const status = Number(error.status || error.statusCode);
+  const text = `${error.cause || ""} ${error.message || ""}`;
+  if (status === 451 || /(?:http|api)\s*451|legal reasons/i.test(text)) return "restricted";
+  if (/eai_again|enotfound|dns/i.test(text)) return "dns";
+  if (/timeout|timedout/i.test(text)) return "timeout";
+  if (Number.isFinite(status) && status > 0) return "http";
+  return "network";
 }
 
 function delay(ms) {

@@ -23,6 +23,10 @@ services:
       FORMAL_MONITOR_DURATION_SECONDS: 0
       FORMAL_MONITOR_TIMEZONE: Asia/Shanghai
       FORMAL_MONITOR_OUTPUT_DIR: /app/data/formal-signal-monitor
+      FORMAL_MONITOR_FILE_LOG_ENABLED: "true"
+      FORMAL_MONITOR_LOG_DIR: /app/data/logs/formal-monitor
+      FORMAL_MONITOR_LOG_MAX_BYTES: "10485760"
+      FORMAL_MONITOR_LOG_MAX_ARCHIVES: "14"
     volumes:
       # 持久化数据目录 → NAS 共享文件夹
       - ./data:/app/data
@@ -88,6 +92,7 @@ services:
       - .env
     environment:
       START_MODE: server
+      FORMAL_MONITOR_OUTPUT_DIR: /app/data/formal-signal-monitor
     ports:
       - "4173:4173"
     volumes:

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Bi-Agent 本地交易辅助</title>
-    <link rel="stylesheet" href="/styles.css?v=20260705-market-watch" />
+    <link rel="stylesheet" href="/styles.css?v=20260714-monitor-clarity" />
   </head>
   <body>
     <main class="app">
@@ -138,6 +138,17 @@
         </div>
         <div id="monitorEmpty" class="empty">Monitor 数据加载中，或尚未生成数据。</div>
 
+        <div id="monitorRuntimeBanner" class="monitor-runtime-banner" hidden>
+          <div id="monitorEntryState" class="monitor-runtime-item">
+            <strong id="monitorEntryMode">-</strong>
+            <span id="monitorEntryDetail">-</span>
+          </div>
+          <div id="monitorDataSource" class="monitor-runtime-item">
+            <strong id="monitorDataSourceLabel">-</strong>
+            <span id="monitorDataSourceDetail">-</span>
+          </div>
+        </div>
+
         <!-- 概览统计 -->
         <div id="monitorOverview" class="monitor-overview" hidden>
           <div class="monitor-stat">
@@ -153,8 +164,12 @@
             <strong id="monitorScanCount">0</strong>
           </div>
           <div class="monitor-stat">
-            <span>总交易数</span>
-            <strong id="monitorTotalTrades">0</strong>
+            <span>已平仓</span>
+            <strong id="monitorClosedTrades">0</strong>
+          </div>
+          <div class="monitor-stat">
+            <span>部分减仓</span>
+            <strong id="monitorPartialCloses">0</strong>
           </div>
           <div class="monitor-stat">
             <span>胜率</span>
@@ -167,9 +182,11 @@
         </div>
 
         <!-- 当前持仓 -->
-        <div id="monitorPositions" class="monitor-section" hidden>
+        <div id="monitorPositions" class="monitor-section">
           <h3>当前持仓</h3>
-          <div id="positionsList" class="monitor-table"></div>
+          <div id="positionsList" class="monitor-table">
+            <div class="monitor-inline-state">正在读取持仓数据...</div>
+          </div>
         </div>
 
         <!-- 最近交易 -->
@@ -202,6 +219,6 @@
       </section>
     </main>
 
-    <script type="module" src="/app.js?v=20260712-persistent-monitor"></script>
+    <script type="module" src="/app.js?v=20260714-monitor-clarity"></script>
   </body>
 </html>

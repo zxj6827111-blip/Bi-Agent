@@ -486,3 +486,55 @@ curl -X POST "your-webhook-url" -H "Content-Type: application/json" -d '{"msg_ty
 2. 最近 3 天的 session JSON 文件
 3. `docker compose logs --tail=500` 的输出
 4. 任何你观察到的异常现象描述
+
+---
+
+## 十一、Monitor 状态解释、诊断与持久日志
+
+### 11.1 页面状态的含义
+
+- “当前暂无持仓”表示 `positions=[]`，不表示数据文件读取失败或持仓被删除。
+- `OBSERVE_ONLY` 表示风险护栏暂时禁止新开仓。页面会显示触发原因和预计恢复时间；`session_max_drawdown` 没有自动恢复时间，本 Session 不再开仓。
+- “部分减仓”是同一主仓位的执行记录，不应当作一笔新的独立交易；概览会分别显示完整平仓数和部分减仓数。
+- 数据源状态会区分请求超时、DNS 临时解析失败（如 `EAI_AGAIN`）、HTTP 451 地区/法律限制以及其他网络错误。
+
+### 11.2 只读诊断端点
+
+```bash
+curl -s http://127.0.0.1:4173/api/monitor/diagnostics
+```
+
+端点只返回容器内实际读取的 `latest.json`、`runtime.json` 路径、大小、修改时间、SHA256 和一致性结果。它不会返回 `.env`、API Key、飞书配置、原始交易内容或日志内容。路径是容器路径 `/app/data/...`，不是 NAS 宿主机路径。
+
+### 11.3 跨容器持久日志
+
+Monitor 仍然保留 `docker compose logs` 输出，同时将副本写入：
+
+```text
+data/logs/formal-monitor/formal-monitor.log
+data/logs/formal-monitor/formal-monitor.log.1
+...
+data/logs/formal-monitor/formal-monitor.log.14
+```
+
+单文件上限默认 10MB，最多保留 14 个归档，总量约 150MB。文件位于现有 `./data:/app/data` bind mount 中，重建容器后仍然保留。
+
+```bash
+tail -f data/logs/formal-monitor/formal-monitor.log
+du -sh data/logs/formal-monitor
+```
+
+文件日志不可写时，系统只会在 stderr 告警一次并继续监控，不会因为日志故障停止交易监控。不要把启动命令改成 `node ... | tee`，否则可能破坏 SIGTERM checkpoint。
+
+### 11.4 更新后的验收
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 bi-agent-monitor
+curl -s http://127.0.0.1:4173/api/monitor/status
+curl -s http://127.0.0.1:4173/api/monitor/diagnostics
+tail -n 100 data/logs/formal-monitor/formal-monitor.log
+```
+
+NAS 路径区分大小写。本文早期示例使用 `/vol1/docker/bi-agent`；当前部署实际为 `/vol1/docker/Bi-Agent` 时，所有 `cd`、备份和同步命令都必须使用实际大小写路径。

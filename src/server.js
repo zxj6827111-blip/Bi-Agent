@@ -7,6 +7,7 @@ import { dirname } from "node:path";
 import { config } from "./config.js";
 import { getRuntimeState, refreshEvaluationsForSession, runScan, stopScan } from "./scanner.js";
 import { getWatchStatus, refreshWatch, startWatch, stopWatch } from "./watcher.js";
+import { buildMonitorDiagnostics, buildMonitorSessionSummary, buildMonitorStatus } from "./monitorStatus.js";
 import {
   getScanSession,
   listPaperTrades,
@@ -117,6 +118,10 @@ const server = createServer(async (req, res) => {
       return sendJson(res, { ok: true, monitor: await getMonitorStatus() });
     }
 
+    if (url.pathname === "/api/monitor/diagnostics" && req.method === "GET") {
+      return sendJson(res, { ok: true, diagnostics: await buildMonitorDiagnostics(monitorOutputDir) });
+    }
+
     if (url.pathname === "/api/monitor/sessions" && req.method === "GET") {
       const limit = Number(url.searchParams.get("limit") || 10);
       return sendJson(res, { ok: true, sessions: await listMonitorSessions(limit) });
@@ -207,38 +212,7 @@ async function getMonitorStatus() {
   try {
     const raw = await readFile(latestPath, "utf8");
     const data = JSON.parse(raw);
-    return {
-      available: true,
-      startedAt: data.startedAt || null,
-      finishedAt: data.finishedAt || null,
-      status: data.status || "unknown",
-      scanCount: data.scanCount || 0,
-      positions: (data.positions || []).map((p) => ({
-        symbol: p.symbol,
-        side: p.side,
-        entryPrice: p.entryPrice,
-        stopLoss: p.stopLoss,
-        takeProfit: p.takeProfit,
-        openedAt: p.openedAt,
-        tradeStyle: p.tradeStyle,
-        unrealizedPercent: p.unrealizedPercent ?? null
-      })),
-      trades: (data.trades || []).slice(-30).map((t) => ({
-        symbol: t.symbol,
-        side: t.side,
-        status: t.status,
-        entryPrice: t.entryPrice,
-        exitPrice: t.exitPrice,
-        netReturnPercent: t.netReturnPercent ?? t.estimatedNetReturnPercent ?? t.grossReturnPercent ?? null,
-        grossReturnPercent: t.grossReturnPercent ?? null,
-        openedAt: t.openedAt,
-        closedAt: t.closedAt,
-        secondsHeld: t.secondsHeld,
-        outcome: t.outcome
-      })),
-      summary: data.summary || null,
-      errors: (data.errors || []).slice(-10)
-    };
+    return buildMonitorStatus(data);
   } catch {
     return { available: false, message: "Failed to read monitor data" };
   }
@@ -258,15 +232,7 @@ async function listMonitorSessions(limit = 10) {
       try {
         const raw = await readFile(join(monitorOutputDir, file), "utf8");
         const data = JSON.parse(raw);
-        sessions.push({
-          file,
-          startedAt: data.startedAt,
-          finishedAt: data.finishedAt,
-          status: data.status,
-          scanCount: data.scanCount,
-          tradeCount: (data.trades || []).length,
-          summary: data.summary || null
-        });
+        sessions.push(buildMonitorSessionSummary(file, data));
       } catch {
         // skip corrupt files
       }

@@ -1268,6 +1268,46 @@ li {
 
 /* ---- Monitor 纸面交易监控面板 ---- */
 
+.monitor-runtime-banner {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.monitor-runtime-item {
+  border-left: 4px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 12px;
+}
+
+.monitor-runtime-item strong {
+  font-size: 13px;
+}
+
+.monitor-runtime-item span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.monitor-runtime-item.active,
+.monitor-runtime-item.healthy {
+  border-color: var(--positive);
+}
+
+.monitor-runtime-item.observe-only,
+.monitor-runtime-item.degraded {
+  border-color: var(--warning);
+}
+
+.monitor-runtime-item.unknown {
+  border-color: var(--muted);
+}
+
 .monitor-overview {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -1335,6 +1375,18 @@ li {
   gap: 4px;
 }
 
+.monitor-inline-state {
+  border: 1px dashed var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  padding: 14px 12px;
+}
+
+.monitor-inline-state.error {
+  border-color: #fecaca;
+  color: var(--danger);
+}
+
 .monitor-row {
   display: flex;
   flex-wrap: wrap;
@@ -1374,6 +1426,28 @@ li {
   color: #b42318;
 }
 
+.monitor-trade-status {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 7px;
+}
+
+.monitor-trade-status.partial {
+  border-color: #f2cf82;
+  color: var(--warning);
+}
+
+.monitor-trade-status.final {
+  color: #475569;
+}
+
+.monitor-trade-status.open {
+  border-color: #86efac;
+  color: var(--positive);
+}
+
 .monitor-time {
   color: var(--muted);
   font-size: 12px;
@@ -1395,4 +1469,10 @@ li {
   font-size: 12px;
   color: var(--danger);
   border: 1px solid #fecaca;
+}
+
+@media (max-width: 720px) {
+  .monitor-runtime-banner {
+    grid-template-columns: 1fr;
+  }
 }

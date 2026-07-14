@@ -1,3 +1,5 @@
+import { presentDataSource, presentEntryState, presentMonitorTrade } from "./monitorPresentation.js?v=20260714-monitor-clarity";
+
 const state = {
   currentSession: null,
   currentFilter: "all",
@@ -43,11 +45,19 @@ const els = {
   // Monitor elements
   monitorStatus: document.querySelector("#monitorStatus"),
   monitorEmpty: document.querySelector("#monitorEmpty"),
+  monitorRuntimeBanner: document.querySelector("#monitorRuntimeBanner"),
+  monitorEntryState: document.querySelector("#monitorEntryState"),
+  monitorEntryMode: document.querySelector("#monitorEntryMode"),
+  monitorEntryDetail: document.querySelector("#monitorEntryDetail"),
+  monitorDataSource: document.querySelector("#monitorDataSource"),
+  monitorDataSourceLabel: document.querySelector("#monitorDataSourceLabel"),
+  monitorDataSourceDetail: document.querySelector("#monitorDataSourceDetail"),
   monitorOverview: document.querySelector("#monitorOverview"),
   monitorSessionStatus: document.querySelector("#monitorSessionStatus"),
   monitorStartedAt: document.querySelector("#monitorStartedAt"),
   monitorScanCount: document.querySelector("#monitorScanCount"),
-  monitorTotalTrades: document.querySelector("#monitorTotalTrades"),
+  monitorClosedTrades: document.querySelector("#monitorClosedTrades"),
+  monitorPartialCloses: document.querySelector("#monitorPartialCloses"),
   monitorWinRate: document.querySelector("#monitorWinRate"),
   monitorTotalReturn: document.querySelector("#monitorTotalReturn"),
   monitorPositions: document.querySelector("#monitorPositions"),
@@ -2028,13 +2038,12 @@ async function loadMonitorStatus() {
     const res = await fetch("/api/monitor/status");
     const data = await res.json();
     if (!data.ok || !data.monitor?.available) {
-      els.monitorStatus.textContent = "无数据";
-      els.monitorEmpty.hidden = false;
+      showMonitorUnavailable(data.monitor?.message || data.error || "Monitor 数据尚未生成");
       return;
     }
     renderMonitorStatus(data.monitor);
   } catch (err) {
-    els.monitorStatus.textContent = "加载失败";
+    showMonitorUnavailable(err.message || "Monitor 接口请求失败");
   }
 }
 
@@ -2053,6 +2062,7 @@ async function loadMonitorSessions() {
 function renderMonitorStatus(m) {
   els.monitorEmpty.hidden = true;
   els.monitorOverview.hidden = false;
+  els.monitorRuntimeBanner.hidden = false;
   els.monitorStatus.textContent = m.status === "running" ? "运行中" : m.status;
 
   const statusColors = { running: "#22c55e", completed: "#94a3b8", timeout: "#f59e0b" };
@@ -2062,8 +2072,12 @@ function renderMonitorStatus(m) {
   els.monitorStartedAt.textContent = m.startedAt ? formatTime(m.startedAt) : "-";
   els.monitorScanCount.textContent = m.scanCount || 0;
 
-  const tradeCount = m.trades?.length || 0;
-  els.monitorTotalTrades.textContent = tradeCount;
+  const closedTradeCount = m.summary?.closed
+    ?? (m.trades || []).filter((trade) => trade.status === "closed" && !trade.isPartialClose).length;
+  const partialCloseCount = m.summary?.partialCloses
+    ?? (m.trades || []).filter((trade) => trade.isPartialClose).length;
+  els.monitorClosedTrades.textContent = closedTradeCount;
+  els.monitorPartialCloses.textContent = partialCloseCount;
 
   if (m.summary) {
     const wr = m.summary.netWinRate ?? m.summary.winRate;
@@ -2071,11 +2085,17 @@ function renderMonitorStatus(m) {
     const tr = m.summary.totalEstimatedNetReturnPercent ?? m.summary.totalNetReturnPercent ?? m.summary.totalReturnPercent;
     els.monitorTotalReturn.textContent = typeof tr === "number" ? `${tr > 0 ? "+" : ""}${tr.toFixed(2)}%` : "-";
     els.monitorTotalReturn.style.color = tr > 0 ? "#22c55e" : tr < 0 ? "#ef4444" : "#94a3b8";
+  } else {
+    els.monitorWinRate.textContent = "-";
+    els.monitorTotalReturn.textContent = "-";
+    els.monitorTotalReturn.style.color = "#94a3b8";
   }
 
+  renderMonitorRuntimeState(m.entryState, m.dataSource);
+
   // Positions
+  els.monitorPositions.hidden = false;
   if (m.positions?.length) {
-    els.monitorPositions.hidden = false;
     els.positionsList.innerHTML = m.positions.map((p) => `
       <div class="monitor-row">
         <span class="monitor-symbol">${escapeHtml(p.symbol)}</span>
@@ -2088,7 +2108,7 @@ function renderMonitorStatus(m) {
       </div>
     `).join("");
   } else {
-    els.monitorPositions.hidden = true;
+    els.positionsList.innerHTML = `<div class="monitor-inline-state">当前暂无持仓</div>`;
   }
 
   // Trades
@@ -2097,11 +2117,13 @@ function renderMonitorStatus(m) {
     els.tradesList.innerHTML = m.trades.map((t) => {
       const pnl = t.netReturnPercent;
       const color = pnl > 0 ? "#22c55e" : pnl < 0 ? "#ef4444" : "#94a3b8";
+      const presentation = presentMonitorTrade(t);
       return `
         <div class="monitor-row">
           <span class="monitor-symbol">${escapeHtml(t.symbol)}</span>
           <span class="monitor-side ${t.side}">${t.side === "long" ? "做多" : "做空"}</span>
-          <span>${t.status === "closed" ? "已平仓" : t.status}</span>
+          <span class="monitor-trade-status ${t.isPartialClose ? "partial" : t.status === "open" ? "open" : "final"}">${escapeHtml(presentation.statusLabel)}</span>
+          <span>原因 ${escapeHtml(presentation.outcomeLabel)}</span>
           <span>入场 ${t.entryPrice}</span>
           <span>出场 ${t.exitPrice ?? "-"}</span>
           <span style="color:${color};font-weight:600">${typeof pnl === "number" ? `${pnl > 0 ? "+" : ""}${pnl.toFixed(2)}%` : "-"}</span>
@@ -2129,6 +2151,33 @@ function renderMonitorStatus(m) {
   }
 }
 
+function showMonitorUnavailable(message) {
+  els.monitorStatus.textContent = "读取失败";
+  els.monitorStatus.style.color = "#ef4444";
+  els.monitorEmpty.hidden = false;
+  els.monitorEmpty.textContent = `Monitor 数据读取失败：${message}`;
+  els.monitorOverview.hidden = true;
+  els.monitorRuntimeBanner.hidden = true;
+  els.monitorPositions.hidden = false;
+  els.positionsList.innerHTML = `<div class="monitor-inline-state error">持仓数据读取失败，无法确认当前是否有持仓。</div>`;
+  els.monitorTrades.hidden = true;
+  els.monitorErrors.hidden = true;
+}
+
+function renderMonitorRuntimeState(entryState, dataSource) {
+  const entry = presentEntryState(entryState);
+  els.monitorEntryState.className = `monitor-runtime-item ${entry.tone}`;
+  els.monitorEntryMode.textContent = entry.modeLabel;
+  els.monitorEntryDetail.textContent = entryState?.resumeAt
+    ? `${entry.detail}：${formatTime(entryState.resumeAt)}`
+    : entry.detail;
+
+  const source = presentDataSource(dataSource);
+  els.monitorDataSource.className = `monitor-runtime-item ${source.tone}`;
+  els.monitorDataSourceLabel.textContent = source.label;
+  els.monitorDataSourceDetail.textContent = source.detail;
+}
+
 function renderMonitorSessions(sessions) {
   els.monitorSessions.hidden = false;
   els.sessionsList.innerHTML = sessions.map((s) => `
@@ -2136,7 +2185,9 @@ function renderMonitorSessions(sessions) {
       <span class="monitor-symbol">${escapeHtml(s.file.replace(".json", ""))}</span>
       <span>${s.status}</span>
       <span>扫描 ${s.scanCount} 轮</span>
-      <span>交易 ${s.tradeCount} 笔</span>
+      <span>主交易 ${s.tradeCount} 笔</span>
+      <span>已平仓 ${s.closedTradeCount ?? s.tradeCount} 笔</span>
+      <span>部分减仓 ${s.partialCloseCount || 0} 次</span>
       <span class="monitor-time">${formatTime(s.startedAt)}</span>
       ${s.summary ? (() => { const value = s.summary.totalEstimatedNetReturnPercent ?? s.summary.totalNetReturnPercent ?? s.summary.totalReturnPercent ?? 0; return `<span style="color:${value >= 0 ? "#22c55e" : "#ef4444"}">${value > 0 ? "+" : ""}${value.toFixed(2)}%</span>`; })() : ""}
       <button type="button" class="monitor-session-detail" data-file="${escapeHtml(s.file)}">详情</button>
@@ -2155,12 +2206,15 @@ async function loadMonitorSessionDetail(file) {
     const trades = data.session.trades || [];
     els.monitorSessionDetail.hidden = false;
     els.monitorSessionDetailTitle.textContent = `${file.replace(".json", "")} 交易详情`;
-    els.monitorSessionDetailList.innerHTML = trades.length ? trades.map((t) => `
-      ${(() => { const pnl = t.netReturnPercent ?? t.estimatedNetReturnPercent ?? t.grossReturnPercent; return `
+    els.monitorSessionDetailList.innerHTML = trades.length ? trades.map((t) => {
+      const pnl = t.netReturnPercent ?? t.estimatedNetReturnPercent ?? t.grossReturnPercent;
+      const presentation = presentMonitorTrade(t);
+      return `
       <div class="monitor-row">
         <span class="monitor-symbol">${escapeHtml(t.symbol)}</span>
         <span class="monitor-side ${t.side}">${t.side === "long" ? "做多" : "做空"}</span>
-        <span>${t.status === "closed" ? "已平仓" : "持仓中"}${t.carriedOver ? "（隔夜）" : ""}</span>
+        <span class="monitor-trade-status ${t.isPartialClose ? "partial" : t.status === "open" ? "open" : "final"}">${escapeHtml(presentation.statusLabel)}${t.carriedOver ? "（隔夜）" : ""}</span>
+        <span>原因 ${escapeHtml(presentation.outcomeLabel)}</span>
         <span>入场 ${t.entryPrice}</span>
         <span>出场 ${t.exitPrice ?? "-"}</span>
         <span>止损 ${t.stopLoss ?? "-"}</span>
@@ -2168,8 +2222,8 @@ async function loadMonitorSessionDetail(file) {
         <span>${typeof pnl === "number" ? `净收益 ${pnl > 0 ? "+" : ""}${pnl.toFixed(2)}%` : "净收益 -"}</span>
         <span class="monitor-time">${formatTime(t.closedAt || t.openedAt)}</span>
       </div>
-      `; })()}
-    `).join("") : `<div class="message">该自然日没有交易记录。</div>`;
+      `;
+    }).join("") : `<div class="message">该自然日没有交易记录。</div>`;
   } catch (error) {
     els.monitorSessionDetail.hidden = false;
     els.monitorSessionDetailList.innerHTML = `<div class="message">详情读取失败：${escapeHtml(error.message)}</div>`;

@@ -35,6 +35,9 @@ test("BinanceClient retries fallback endpoints before failing a market request",
   assert.ok(requestedUrls[1].startsWith("https://good.example/api/v3/depth"));
   assert.equal(book.bestBid, 100);
   assert.equal(book.bestAsk, 101);
+  assert.equal(client.getHealth().spot.status, "degraded");
+  assert.equal(client.getHealth().spot.errorKind, "timeout");
+  assert.equal(client.getHealth().spot.lastFallbackErrors.length, 1);
 });
 
 test("BinanceClient retries a transient timeout once and exposes request health", async (t) => {
@@ -64,6 +67,37 @@ test("BinanceClient retries a transient timeout once and exposes request health"
   assert.equal(requests, 2);
   assert.equal(client.getHealth().spot.successCount, 1);
   assert.equal(client.getHealth().spot.failureCount, 0);
+  assert.equal(client.getHealth().spot.status, "degraded");
+});
+
+test("BinanceClient retries EAI_AGAIN and classifies the recovered request as DNS degradation", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests += 1;
+    if (requests === 1) {
+      const error = new Error("fetch failed");
+      error.cause = { code: "EAI_AGAIN" };
+      throw error;
+    }
+    return new Response(JSON.stringify({ lastUpdateId: 1, bids: [["1", "1"]], asks: [["2", "1"]] }), { status: 200 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const client = new BinanceClient({
+    spotBaseUrl: "https://data-api.binance.vision",
+    futuresBaseUrl: "https://fapi.binance.com",
+    requestRetryCount: 1,
+    requestRetryBaseDelayMs: 0
+  });
+
+  await client.getOrderBookDepth("spot", "BTCUSDT", 5);
+
+  assert.equal(requests, 2);
+  assert.equal(client.getHealth().spot.status, "degraded");
+  assert.equal(client.getHealth().spot.errorKind, "dns");
+  assert.equal(client.getHealth().spot.lastFallbackErrors[0].cause, "EAI_AGAIN");
 });
 
 test("BinanceClient does not retry a permanent HTTP 451 response", async (t) => {
@@ -89,6 +123,9 @@ test("BinanceClient does not retry a permanent HTTP 451 response", async (t) => 
   );
   assert.equal(requests, 1);
   assert.equal(client.getHealth().spot.failureCount, 1);
+  assert.equal(client.getHealth().spot.status, "unavailable");
+  assert.equal(client.getHealth().spot.errorKind, "restricted");
+  assert.equal(client.getHealth().spot.statusCode, 451);
 });
 
 test("BinanceClient caches exchangeInfo while continuing to refresh ticker and book data", async (t) => {

@@ -27,6 +27,7 @@ test("formal monitor initializes risk guard constants before starting the monito
   assert.match(source, /netReturnPercent:\s*round\(estimatedNet, 4\)/, "closed trades must persist a UI-compatible net return");
   assert.match(source, /installShutdownCheckpoint\(\)/, "monitor must checkpoint when its container stops");
   assert.match(source, /existsSync\(latestPath\)/, "first persistent deployment must recover the legacy latest checkpoint");
+  assert.match(source, /captureDataSourceHealth\(\)/, "monitor must persist Binance source health with checkpoints");
 });
 
 test("formal monitor restores an old checkpoint and applies feedback only once", async (t) => {
@@ -51,6 +52,7 @@ test("formal monitor restores an old checkpoint and applies feedback only once",
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /before initialization/);
   assert.equal(result.runtime.options.minEdge, 27);
   assert.equal(result.runtime.feedbackAdjustments.currentOptions.minEdge, 27);
+  assert.equal(result.runtime.dataSourceHealth.binance.spot.status, "unknown");
 });
 
 test("formal monitor preserves open positions when final close prices are unavailable", async (t) => {
@@ -108,7 +110,9 @@ test("formal monitor records a hard stop before an expired-position timeout", as
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.runtime.status, "completed");
   assert.equal(result.runtime.positions.length, 0);
-  assert.equal(result.runtime.trades.find((trade) => trade.id === position.id).outcome, "stop");
+  const closedTrade = result.runtime.trades.find((trade) => trade.id === position.id);
+  assert.equal(closedTrade.outcome, "stop");
+  assert.equal(closedTrade.feishuCloseQueuedAt, undefined, "tests must never queue real Feishu notifications");
 });
 
 async function runMonitorWithCheckpoint(t, checkpoint, extraEnv = {}) {
@@ -131,7 +135,15 @@ async function runMonitorWithCheckpoint(t, checkpoint, extraEnv = {}) {
       FORMAL_MONITOR_MIN_EDGE: "25",
       FORMAL_MONITOR_AI_ENABLED: "false",
       FORMAL_MONITOR_AI_REQUIRED: "false",
-      ...extraEnv
+      ...extraEnv,
+      NODE_ENV: "test",
+      FEISHU_ENABLED: "false",
+      FEISHU_DRY_RUN: "true",
+      FEISHU_WEBHOOK_URL: "",
+      FEISHU_SECRET: "",
+      FEISHU_APP_ID: "",
+      FEISHU_APP_SECRET: "",
+      FEISHU_RECEIVE_ID: ""
     },
     stdio: ["ignore", "pipe", "pipe"]
   });

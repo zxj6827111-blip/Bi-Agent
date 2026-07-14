@@ -162,6 +162,10 @@ const state = {
   nextScanAt: null,
   scanCount: 0,
   errors: [],
+  dataSourceHealth: {
+    updatedAt: startedAt,
+    binance: client.getHealth()
+  },
   ai: {
     enabled: options.aiEnabled,
     required: options.aiRequired,
@@ -293,6 +297,7 @@ async function runMonitor() {
       await pollOpenPositions();
     }
 
+    captureDataSourceHealth();
     persistState();
     await sleep(nextLoopSleepSeconds(deadline) * 1000);
   }
@@ -304,6 +309,7 @@ async function runMonitor() {
   await flushPendingFeishuNotifications();
   state.status = closeResult.failedCount ? "close_failed" : "completed";
   state.finishedAt = new Date().toISOString();
+  captureDataSourceHealth();
   state.summary = summarizeTrades(state.trades);
   persistState();
 }
@@ -2789,6 +2795,13 @@ function recordError(scope, error, extra = {}) {
   state.errors.push(item);
   state.errors = state.errors.slice(-100);
   console.warn(`[formal-monitor] ${scope} error: ${item.message}`);
+}
+
+function captureDataSourceHealth() {
+  state.dataSourceHealth = {
+    updatedAt: new Date().toISOString(),
+    binance: client.getHealth()
+  };
 }
 
 function estimateFormalRoundTripCost() {

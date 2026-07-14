@@ -21,7 +21,7 @@ run_server() {
 run_monitor() {
   echo "[entrypoint] Starting formal signal paper monitor..."
   echo "[entrypoint] Duration: ${FORMAL_MONITOR_DURATION_SECONDS:-86400}s"
-  node scripts/formalSignalPaperMonitor.js &
+  node --import ./src/runtimeFileLogger.js scripts/formalSignalPaperMonitor.js &
   MONITOR_PID=$!
 }
 
