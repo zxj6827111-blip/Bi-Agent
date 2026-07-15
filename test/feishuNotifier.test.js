@@ -7,6 +7,7 @@ import {
   buildLifecycleAlertText,
   buildMarketAlertText,
   getTenantAccessTokenCacheExpiry,
+  marketAlertKey,
   passesFeishuHighPrecision
 } from "../src/feishuNotifier.js";
 
@@ -30,6 +31,32 @@ test("getTenantAccessTokenCacheExpiry refreshes token one minute before expiry",
   const now = 1_700_000_000_000;
   assert.equal(getTenantAccessTokenCacheExpiry(7_200, now), now + 7_140_000);
   assert.equal(getTenantAccessTokenCacheExpiry(30, now), now);
+});
+
+test("market alert cooldown key ignores prices that move between scans", () => {
+  const base = {
+    symbol: "BTCUSDT",
+    marketType: "spot",
+    direction: "long",
+    timeframe: "4h",
+    signalLevel: "watch"
+  };
+  const first = marketAlertKey({
+    ...base,
+    entryRange: [100, 100],
+    stopLoss: 99,
+    takeProfit: { tp1: 102 }
+  });
+  const nextScan = marketAlertKey({
+    ...base,
+    entryRange: [101, 101],
+    stopLoss: 100,
+    takeProfit: { tp1: 103 }
+  });
+
+  assert.equal(first, nextScan);
+  assert.notEqual(first, marketAlertKey({ ...base, direction: "short" }));
+  assert.notEqual(first, marketAlertKey({ ...base, signalLevel: "formal" }));
 });
 
 test("buildMarketAlertText includes entry, stop and target prices", () => {

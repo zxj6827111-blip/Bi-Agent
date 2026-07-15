@@ -52,7 +52,7 @@ test("monitor status exposes entry guard, execution fields, and sanitized struct
   assert.deepEqual(status.positions, []);
   assert.deepEqual(status.entryState, {
     mode: "observe_only",
-    reason: "consecutive_stop_loss",
+    reason: "consecutive_net_loss",
     resumeAt: "2026-07-14T16:00:00.000Z"
   });
   assert.deepEqual(status.trades[0], {
@@ -76,6 +76,21 @@ test("monitor status exposes entry guard, execution fields, and sanitized struct
   assert.deepEqual(status.dataSource.categories, ["timeout", "dns", "restricted", "other"]);
   assert.deepEqual(status.dataSource.counts, { timeout: 1, dns: 1, restricted: 1, other: 2 });
   assert.doesNotMatch(JSON.stringify(status.dataSource), /should-not-leak/);
+});
+
+test("monitor status exposes operational observe-only reasons", () => {
+  const status = buildMonitorStatus({
+    entryGuard: {
+      entryBlocked: true,
+      reason: "manual_observe_only+derivatives_unavailable"
+    }
+  });
+
+  assert.deepEqual(status.entryState, {
+    mode: "observe_only",
+    reason: "manual_observe_only+derivatives_unavailable",
+    resumeAt: null
+  });
 });
 
 test("structured health returns to healthy after the fallback window expires", () => {

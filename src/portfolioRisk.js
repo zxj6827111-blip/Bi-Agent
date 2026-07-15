@@ -117,7 +117,7 @@ export function activeRiskGuard(riskGuard = {}, nowMs = Date.now()) {
     guards.push({ reason: "session_max_drawdown", resumeAt: null });
   }
   if (riskGuard.consecutiveStopPauseUntil && Date.parse(riskGuard.consecutiveStopPauseUntil) > nowMs) {
-    guards.push({ reason: "consecutive_stop_loss", resumeAt: riskGuard.consecutiveStopPauseUntil });
+    guards.push({ reason: "consecutive_net_loss", resumeAt: riskGuard.consecutiveStopPauseUntil });
   }
   if (riskGuard.dailyLossPauseUntil && Date.parse(riskGuard.dailyLossPauseUntil) > nowMs) {
     guards.push({ reason: "daily_loss_limit", resumeAt: riskGuard.dailyLossPauseUntil });

@@ -36,3 +36,26 @@ export function atomicWriteJson(path, value) {
   writeFileSync(tempPath, JSON.stringify(value, null, 2), "utf8");
   renameSync(tempPath, path);
 }
+
+export function buildCompactMonitorSnapshot(state = {}) {
+  const {
+    diagnostics: _diagnostics,
+    opportunityHistory: _opportunityHistory,
+    ...rest
+  } = state;
+  return {
+    ...rest,
+    persistenceVersion: Math.max(2, Number(state.persistenceVersion) || 0),
+    positions: compactTrades(state.positions, true),
+    trades: compactTrades(state.trades, false)
+  };
+}
+
+function compactTrades(trades, keepOpenPolls) {
+  if (!Array.isArray(trades)) return [];
+  return trades.map((trade) => {
+    if (keepOpenPolls && trade?.status === "open") return trade;
+    const { polls: _polls, ...compact } = trade || {};
+    return compact;
+  });
+}

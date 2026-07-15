@@ -269,17 +269,14 @@ function cleanupSentCache(now, cooldownMs) {
   }
 }
 
-function marketAlertKey(alert = {}) {
+export function marketAlertKey(alert = {}) {
   return [
     "market",
     alert.symbol,
     alert.marketType,
     alert.direction,
     alert.timeframe,
-    alert.signalLevel,
-    formatRange(alert.entryRange),
-    formatPrice(alert.stopLoss),
-    formatPrice(alert.takeProfit?.tp1)
+    alert.signalLevel
   ].join(":");
 }
 

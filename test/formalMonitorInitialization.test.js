@@ -28,6 +28,8 @@ test("formal monitor initializes risk guard constants before starting the monito
   assert.match(source, /installShutdownCheckpoint\(\)/, "monitor must checkpoint when its container stops");
   assert.match(source, /existsSync\(latestPath\)/, "first persistent deployment must recover the legacy latest checkpoint");
   assert.match(source, /captureDataSourceHealth\(\)/, "monitor must persist Binance source health with checkpoints");
+  assert.doesNotMatch(source, /adjustThresholdsByRegime/, "market regime must not adjust both score and thresholds");
+  assert.match(source, /marketRegimeScoreAdjustment\(regimeBias, side\)/, "market regime should remain a soft score input");
 });
 
 test("formal monitor restores an old checkpoint and applies feedback only once", async (t) => {
@@ -53,6 +55,7 @@ test("formal monitor restores an old checkpoint and applies feedback only once",
   assert.equal(result.runtime.options.minEdge, 27);
   assert.equal(result.runtime.feedbackAdjustments.currentOptions.minEdge, 27);
   assert.equal(result.runtime.dataSourceHealth.binance.spot.status, "unknown");
+  assert.deepEqual(result.latest, result.runtime);
 });
 
 test("formal monitor preserves open positions when final close prices are unavailable", async (t) => {
@@ -163,11 +166,13 @@ async function runMonitorWithCheckpoint(t, checkpoint, extraEnv = {}) {
     });
   });
   const runtime = JSON.parse(await readFile(join(outputDir, "runtime.json"), "utf8"));
+  const latest = JSON.parse(await readFile(join(outputDir, "latest.json"), "utf8"));
   return {
     exitCode,
     stdout: Buffer.concat(stdout).toString("utf8"),
     stderr: Buffer.concat(stderr).toString("utf8"),
-    runtime
+    runtime,
+    latest
   };
 }
 

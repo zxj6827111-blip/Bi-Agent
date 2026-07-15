@@ -3,14 +3,19 @@ const OUTCOME_LABELS = {
   signal_collapse: "信号衰减",
   tp: "止盈",
   stop: "止损",
+  trailing_stop: "追踪止损",
+  breakeven_stop: "保本止损",
   scalp_timeout: "超短线超时",
   timeout: "持仓超时"
 };
 
 const ENTRY_REASON_LABELS = {
-  consecutive_stop_loss: "连续止损保护",
+  consecutive_stop_loss: "连续净亏损保护",
+  consecutive_net_loss: "连续净亏损保护",
   daily_loss_limit: "单日亏损上限",
-  session_max_drawdown: "Session 最大回撤保护"
+  session_max_drawdown: "Session 最大回撤保护",
+  manual_observe_only: "人工观察模式",
+  derivatives_unavailable: "合约衍生数据不可用"
 };
 
 const DATA_SOURCE_LABELS = {
@@ -30,6 +35,14 @@ export function presentMonitorTrade(trade = {}) {
     statusLabel,
     outcomeLabel: trade.outcome ? OUTCOME_LABELS[trade.outcome] || trade.outcome : "-"
   };
+}
+
+export function monitorAccountReturn(summary = {}) {
+  const value = summary.portfolioRisk?.totalAccountReturnPercent
+    ?? summary.totalEstimatedNetReturnPercent
+    ?? summary.totalNetReturnPercent
+    ?? summary.totalReturnPercent;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export function presentEntryState(entryState = {}) {

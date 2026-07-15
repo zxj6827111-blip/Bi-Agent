@@ -8,14 +8,23 @@ const DATA_SOURCE_CATEGORIES = ["timeout", "dns", "restricted", "other"];
 
 export function buildMonitorStatus(data = {}, { nowMs = Date.now() } = {}) {
   const riskGuard = activeRiskGuard(data.riskGuard || {}, nowMs);
+  const operationalGuard = data.entryGuard?.entryBlocked ? data.entryGuard : null;
+  const entryReasons = [
+    operationalGuard?.reason,
+    riskGuard?.reason
+  ].filter(Boolean);
   return {
     available: true,
     startedAt: data.startedAt || null,
     finishedAt: data.finishedAt || null,
     status: data.status || "unknown",
     scanCount: data.scanCount || 0,
-    entryState: riskGuard
-      ? { mode: "observe_only", reason: riskGuard.reason, resumeAt: riskGuard.resumeAt }
+    entryState: entryReasons.length
+      ? {
+          mode: "observe_only",
+          reason: [...new Set(entryReasons.flatMap((reason) => String(reason).split("+")))].join("+"),
+          resumeAt: operationalGuard ? null : riskGuard?.resumeAt || null
+        }
       : { mode: "active", reason: null, resumeAt: null },
     dataSource: summarizeMonitorDataSource(data, { nowMs }),
     positions: (data.positions || []).map((position) => ({

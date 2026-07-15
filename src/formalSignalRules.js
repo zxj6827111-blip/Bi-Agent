@@ -15,6 +15,8 @@ export function buildFormalSafetyFailures(candidate, options = {}) {
   const maxSpreadPercent = numberOrInfinity(options.maxSpreadPercent);
   const minNetTargetPercent = Number(options.minNetTargetPercent);
   const minRewardRisk = Number(options.minRewardRisk);
+  const minNetRewardRisk = Number(options.minNetRewardRisk);
+  const requireDerivativesHealthy = Boolean(options.requireDerivativesHealthy);
 
   if (Number.isFinite(change24h)) {
     if (side === "long" && Number.isFinite(maxLongChase24hPercent) && change24h >= maxLongChase24hPercent) {
@@ -41,6 +43,17 @@ export function buildFormalSafetyFailures(candidate, options = {}) {
   if (Number.isFinite(targetPercent) && Number.isFinite(stopPercent) && stopPercent > 0 && Number.isFinite(minRewardRisk)) {
     const rewardRisk = targetPercent / stopPercent;
     if (rewardRisk + epsilon < minRewardRisk) failures.push("reward_risk");
+  }
+
+  if (Number.isFinite(targetPercent) && Number.isFinite(stopPercent) && stopPercent > 0 && Number.isFinite(minNetRewardRisk)) {
+    const netTarget = targetPercent - roundTripCostPercent;
+    const netLoss = stopPercent + roundTripCostPercent;
+    const netRatio = netTarget > 0 && netLoss > 0 ? netTarget / netLoss : 0;
+    if (netRatio + epsilon < minNetRewardRisk) failures.push("net_reward_risk");
+  }
+
+  if (requireDerivativesHealthy && candidate?.derivativesStatus !== "ok") {
+    failures.push("derivatives_unavailable");
   }
 
   // Phase 2.1: ADX < 15 + volume < 1.0 时增加 low_trend_strength 失败

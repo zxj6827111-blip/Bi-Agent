@@ -3,14 +3,19 @@ import assert from "node:assert/strict";
 import {
   applyFormalTradeGeometry,
   alignedOpenInterestChange,
+  buildOperationalEntryGuard,
   carryOpenTradeState,
   combineTradeRealizations,
   classifyFilteredSourceQuality,
   derivativesPeriodForInterval,
   executablePrice,
   hardExitOutcome,
+  hasScalpEntryQuality,
   hourAdjustedOptions,
-  hourBiasAt
+  hourBiasAt,
+  marketRegimeScoreAdjustment,
+  netRewardRisk,
+  sourceAllowsScalpExhaustionBypass
 } from "../src/formalMonitorPolicy.js";
 
 test("hard exits take precedence for both long and short positions", () => {
@@ -18,7 +23,53 @@ test("hard exits take precedence for both long and short positions", () => {
   assert.equal(hardExitOutcome({ side: "long", takeProfit: 110, stopLoss: 90 }, 111), "tp");
   assert.equal(hardExitOutcome({ side: "short", takeProfit: 90, stopLoss: 110 }, 111), "stop");
   assert.equal(hardExitOutcome({ side: "short", takeProfit: 90, stopLoss: 110 }, 89), "tp");
+  assert.equal(hardExitOutcome({ side: "long", takeProfit: 110, stopLoss: 100, trailingStopActive: true }, 99), "trailing_stop");
+  assert.equal(hardExitOutcome({ side: "short", takeProfit: 90, stopLoss: 100, breakevenStopApplied: true }, 101), "breakeven_stop");
   assert.equal(hardExitOutcome({ side: "long", takeProfit: null, stopLoss: 90 }, 100), null);
+});
+
+test("only actionable sources bypass scalp exhaustion checks", () => {
+  assert.equal(sourceAllowsScalpExhaustionBypass({ sourceSignal: { qualityStatus: "actionable" } }), true);
+  assert.equal(sourceAllowsScalpExhaustionBypass({ sourceSignal: { qualityStatus: "filtered" } }), false);
+  assert.equal(hasScalpEntryQuality({
+    sourceSignal: { qualityStatus: "filtered" },
+    scalpDecisionProfile: {
+      noSourceMicrostructure: true,
+      noSourceExhaustion: { exhausted: false }
+    }
+  }), true);
+  assert.equal(hasScalpEntryQuality({
+    sourceSignal: { qualityStatus: "filtered" },
+    scalpDecisionProfile: {
+      noSourceMicrostructure: true,
+      noSourceExhaustion: { exhausted: true }
+    }
+  }), false);
+});
+
+test("operational entry guard blocks observe-only and missing derivatives", () => {
+  assert.deepEqual(buildOperationalEntryGuard({
+    observeOnly: true,
+    requireDerivativesHealthy: true,
+    candidates: [{ derivativesStatus: "unavailable" }]
+  }), {
+    entryBlocked: true,
+    reason: "manual_observe_only+derivatives_unavailable",
+    healthyDerivativesCandidates: 0,
+    evaluatedCandidates: 1
+  });
+  assert.equal(buildOperationalEntryGuard({
+    requireDerivativesHealthy: true,
+    candidates: [{ derivativesStatus: "ok" }]
+  }).entryBlocked, false);
+});
+
+test("net reward-risk includes round-trip costs on both outcomes", () => {
+  assert.equal(netRewardRisk({
+    targetPercent: 0.32,
+    stopPercent: 0.24,
+    roundTripCostPercent: 0.2
+  }), 0.2727);
 });
 
 test("empty or invalid books never fabricate an executable price", () => {
@@ -79,6 +130,14 @@ test("Shanghai session bias has explicit boundaries and halves low-liquidity exp
   assert.deepEqual(highVolatility, { maxPositionSizePercentOfEquity: 30 });
 });
 
+test("market regime uses one symmetric soft score adjustment", () => {
+  assert.equal(marketRegimeScoreAdjustment("risk_on", "long"), 4);
+  assert.equal(marketRegimeScoreAdjustment("risk_on", "short"), -4);
+  assert.equal(marketRegimeScoreAdjustment("risk_off", "short"), 4);
+  assert.equal(marketRegimeScoreAdjustment("risk_off", "long"), -4);
+  assert.equal(marketRegimeScoreAdjustment("neutral", "long"), 0);
+});
+
 test("filtered source becomes a warning after independent entry quality passes", () => {
   const candidate = { sourceSignal: { qualityStatus: "filtered" } };
   assert.deepEqual(classifyFilteredSourceQuality(candidate, true), { failure: false, warning: true });
@@ -116,6 +175,8 @@ test("formal trade geometry is recalculated for each shadow profile", () => {
   assert.equal(shadow.targetPercent, 4.4);
   assert.equal(shadow.stopPercent, 2.4);
   assert.ok(shadow.rewardRisk > control.rewardRisk);
+  assert.equal(control.netLossPercent, 3.08);
+  assert.equal(control.netRewardRisk, 1.2338);
 });
 
 test("derivatives requests use the execution period when Binance supports it", () => {

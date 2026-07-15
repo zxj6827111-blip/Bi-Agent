@@ -12,12 +12,18 @@ export function hardExitOutcome(position, exitPrice) {
 
   if (position.side === "long") {
     if (price >= takeProfit) return "tp";
-    if (price <= stopLoss) return "stop";
+    if (price <= stopLoss) return stopExitOutcome(position);
   } else if (position.side === "short") {
     if (price <= takeProfit) return "tp";
-    if (price >= stopLoss) return "stop";
+    if (price >= stopLoss) return stopExitOutcome(position);
   }
   return null;
+}
+
+function stopExitOutcome(position) {
+  if (position?.trailingStopActive) return "trailing_stop";
+  if (position?.breakevenStopApplied) return "breakeven_stop";
+  return "stop";
 }
 
 export function alignedOpenInterestChange(derivatives, executionInterval) {
@@ -107,6 +113,18 @@ export function hourAdjustedOptions(options, bias) {
   return {};
 }
 
+export function marketRegimeScoreAdjustment(regimeBias, side) {
+  if (regimeBias === "risk_on") {
+    if (side === "long") return 4;
+    if (side === "short") return -4;
+  }
+  if (regimeBias === "risk_off") {
+    if (side === "short") return 4;
+    if (side === "long") return -4;
+  }
+  return 0;
+}
+
 export function classifyFilteredSourceQuality(candidate, formalEntryQuality) {
   if (candidate?.sourceSignal?.qualityStatus !== "filtered") {
     return { failure: false, warning: false };
@@ -114,6 +132,48 @@ export function classifyFilteredSourceQuality(candidate, formalEntryQuality) {
   return formalEntryQuality
     ? { failure: false, warning: true }
     : { failure: true, warning: false };
+}
+
+export function sourceAllowsScalpExhaustionBypass(candidate) {
+  return candidate?.sourceSignal?.qualityStatus === "actionable";
+}
+
+export function hasScalpEntryQuality(candidate) {
+  if (sourceAllowsScalpExhaustionBypass(candidate)) return true;
+  if (candidate?.technicalConsensus?.[candidate?.side]?.strong) return true;
+  const decision = candidate?.scalpDecisionProfile;
+  return Boolean(decision?.noSourceMicrostructure && !decision?.noSourceExhaustion?.exhausted);
+}
+
+export function netRewardRisk({ targetPercent, stopPercent, roundTripCostPercent } = {}) {
+  const target = Number(targetPercent);
+  const stop = Number(stopPercent);
+  const cost = Math.max(0, Number(roundTripCostPercent) || 0);
+  const netTarget = target - cost;
+  const netLoss = stop + cost;
+  if (![target, stop].every(Number.isFinite) || netTarget <= 0 || netLoss <= 0) return null;
+  return round(netTarget / netLoss, 4);
+}
+
+export function buildOperationalEntryGuard({
+  observeOnly = false,
+  requireDerivativesHealthy = false,
+  candidates = []
+} = {}) {
+  const reasons = [];
+  if (observeOnly) reasons.push("manual_observe_only");
+  const healthyDerivativesCandidates = candidates
+    .filter((candidate) => candidate?.derivativesStatus === "ok")
+    .length;
+  if (requireDerivativesHealthy && healthyDerivativesCandidates === 0) {
+    reasons.push("derivatives_unavailable");
+  }
+  return {
+    entryBlocked: reasons.length > 0,
+    reason: reasons.join("+") || null,
+    healthyDerivativesCandidates,
+    evaluatedCandidates: candidates.length
+  };
 }
 
 export function applyFormalTradeGeometry(candidate, options = {}) {
@@ -150,6 +210,7 @@ export function applyFormalTradeGeometry(candidate, options = {}) {
     maxStopPercent
   );
   const rewardRisk = stopPercent > 0 ? targetPercent / stopPercent : null;
+  const netRatio = netRewardRisk({ targetPercent, stopPercent, roundTripCostPercent });
 
   return {
     ...candidate,
@@ -158,7 +219,9 @@ export function applyFormalTradeGeometry(candidate, options = {}) {
     targetPercent: round(targetPercent, 4),
     stopPercent: round(stopPercent, 4),
     netTargetPercent: round(targetPercent - roundTripCostPercent, 4),
-    rewardRisk: Number.isFinite(rewardRisk) ? round(rewardRisk, 4) : null
+    netLossPercent: round(stopPercent + roundTripCostPercent, 4),
+    rewardRisk: Number.isFinite(rewardRisk) ? round(rewardRisk, 4) : null,
+    netRewardRisk: netRatio
   };
 }
 

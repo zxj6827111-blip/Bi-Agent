@@ -111,6 +111,20 @@ test("buildFormalSafetyFailures allows boundary-equal net target despite floatin
   assert.deepEqual(failures, []);
 });
 
+test("buildFormalSafetyFailures blocks poor net reward-risk and unavailable derivatives", () => {
+  const failures = buildFormalSafetyFailures({
+    targetPercent: 0.32,
+    stopPercent: 0.24,
+    roundTripCostPercent: 0.2,
+    derivativesStatus: "unavailable"
+  }, {
+    minNetRewardRisk: 1,
+    requireDerivativesHealthy: true
+  });
+
+  assert.deepEqual(failures, ["net_reward_risk", "derivatives_unavailable"]);
+});
+
 test("updateSignalConfirmations requires consecutive scans", () => {
   const first = updateSignalConfirmations({}, [
     { symbol: "BTCUSDT", side: "long" }

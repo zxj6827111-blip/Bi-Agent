@@ -1,4 +1,9 @@
-import { presentDataSource, presentEntryState, presentMonitorTrade } from "./monitorPresentation.js?v=20260714-monitor-clarity";
+import {
+  monitorAccountReturn,
+  presentDataSource,
+  presentEntryState,
+  presentMonitorTrade
+} from "./monitorPresentation.js?v=20260715-entry-guard";
 
 const state = {
   currentSession: null,
@@ -2082,7 +2087,7 @@ function renderMonitorStatus(m) {
   if (m.summary) {
     const wr = m.summary.netWinRate ?? m.summary.winRate;
     els.monitorWinRate.textContent = typeof wr === "number" ? `${(wr * 100).toFixed(1)}%` : "-";
-    const tr = m.summary.totalEstimatedNetReturnPercent ?? m.summary.totalNetReturnPercent ?? m.summary.totalReturnPercent;
+    const tr = monitorAccountReturn(m.summary);
     els.monitorTotalReturn.textContent = typeof tr === "number" ? `${tr > 0 ? "+" : ""}${tr.toFixed(2)}%` : "-";
     els.monitorTotalReturn.style.color = tr > 0 ? "#22c55e" : tr < 0 ? "#ef4444" : "#94a3b8";
   } else {
@@ -2189,7 +2194,7 @@ function renderMonitorSessions(sessions) {
       <span>已平仓 ${s.closedTradeCount ?? s.tradeCount} 笔</span>
       <span>部分减仓 ${s.partialCloseCount || 0} 次</span>
       <span class="monitor-time">${formatTime(s.startedAt)}</span>
-      ${s.summary ? (() => { const value = s.summary.totalEstimatedNetReturnPercent ?? s.summary.totalNetReturnPercent ?? s.summary.totalReturnPercent ?? 0; return `<span style="color:${value >= 0 ? "#22c55e" : "#ef4444"}">${value > 0 ? "+" : ""}${value.toFixed(2)}%</span>`; })() : ""}
+      ${s.summary ? (() => { const value = monitorAccountReturn(s.summary) ?? 0; return `<span style="color:${value >= 0 ? "#22c55e" : "#ef4444"}">${value > 0 ? "+" : ""}${value.toFixed(2)}%</span>`; })() : ""}
       <button type="button" class="monitor-session-detail" data-file="${escapeHtml(s.file)}">详情</button>
     </div>
   `).join("");
